@@ -1,5 +1,5 @@
 {
-  "windows_host": "192.168.248.178",
+  "windows_host": "192.168.0.114",
   "port": 5050,
   "mouse_scale": 1.0,
   "suppress_local_mouse": true

@@ -5,7 +5,6 @@ import json
 import socket
 import sys
 import threading
-import time
 from pathlib import Path
 from typing import Any
 
@@ -128,7 +127,6 @@ class MacControllerClient:
         self.enabled = False
         self.last_mouse_pos: tuple[int, int] | None = None
         self.pressed_keys: set[str] = set()
-        self.cursor_guard_running = False
         self.state_lock = threading.Lock()
 
     def toggle_control_mode(self) -> None:
@@ -140,8 +138,6 @@ class MacControllerClient:
         self.sender.send({"type": "control_mode", "enabled": enabled})
         state = "ON" if enabled else "OFF"
         print(f"Control Windows mode: {state}", flush=True)
-        if enabled:
-            self.start_cursor_guard()
 
     def is_enabled(self) -> bool:
         with self.state_lock:
@@ -208,35 +204,23 @@ class MacControllerClient:
         for key_name in ("ctrl", "alt", "cmd"):
             self.sender.send({"type": "key_up", "key": key_name})
 
-    def start_cursor_guard(self) -> None:
-        with self.state_lock:
-            if self.cursor_guard_running:
-                return
-            self.cursor_guard_running = True
-
-        thread = threading.Thread(target=self.cursor_guard_loop, daemon=True)
-        thread.start()
-
-    def cursor_guard_loop(self) -> None:
-        if sys.platform != "darwin":
-            return
-
-        try:
-            import Quartz
-        except ImportError:
-            return
-
-        safe_point = Quartz.CGPointMake(10, 10)
-        while self.is_enabled():
-            Quartz.CGDisplayMoveCursorToPoint(Quartz.CGMainDisplayID(), safe_point)
-            time.sleep(0.03)
-
-        with self.state_lock:
-            self.cursor_guard_running = False
-
-    def on_native_mouse_move(self, dx: int, dy: int) -> None:
+    def on_native_mouse_move(self, x: float, y: float, dx: int, dy: int) -> None:
         if not self.is_enabled():
             return
+
+        if not dx and not dy:
+            with self.state_lock:
+                if self.last_mouse_pos is None:
+                    self.last_mouse_pos = (int(x), int(y))
+                    return
+                last_x, last_y = self.last_mouse_pos
+                self.last_mouse_pos = (int(x), int(y))
+            dx = int(x) - last_x
+            dy = int(y) - last_y
+        else:
+            with self.state_lock:
+                self.last_mouse_pos = (int(x), int(y))
+
         scaled_dx = dx * self.mouse_scale
         scaled_dy = dy * self.mouse_scale
         if scaled_dx or scaled_dy:
@@ -362,7 +346,8 @@ def run_native_macos_event_tap(client: MacControllerClient) -> None:
         }:
             dx = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaX)
             dy = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventDeltaY)
-            client.on_native_mouse_move(dx, dy)
+            point = Quartz.CGEventGetLocation(event)
+            client.on_native_mouse_move(point.x, point.y, dx, dy)
             return None if client.is_enabled() else event
 
         if event_type in {Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp}:

@@ -15,6 +15,11 @@ DEFAULT_PORT = 5050
 
 mouse_controller = mouse.Controller()
 keyboard_controller = keyboard.Controller()
+event_counts = {
+    "mouse_move": 0,
+    "mouse_click": 0,
+    "key": 0,
+}
 
 
 SPECIAL_KEY_ALIASES = {
@@ -77,12 +82,23 @@ def handle_event(event: dict[str, Any]) -> None:
         dy = int(round(float(event.get("dy", 0))))
         if dx or dy:
             mouse_controller.move(dx, dy)
+            event_counts["mouse_move"] += 1
+            if event_counts["mouse_move"] == 1 or event_counts["mouse_move"] % 50 == 0:
+                print(
+                    f"mouse_move events: {event_counts['mouse_move']} latest dx={dx} dy={dy}",
+                    flush=True,
+                )
         return
 
     if event_type == "mouse_click":
         button = button_from_name(str(event.get("button", "")))
         if button is None:
             return
+        event_counts["mouse_click"] += 1
+        print(
+            f"mouse_click events: {event_counts['mouse_click']} button={button} pressed={event.get('pressed')}",
+            flush=True,
+        )
         if event.get("pressed"):
             mouse_controller.press(button)
         else:
@@ -100,6 +116,9 @@ def handle_event(event: dict[str, Any]) -> None:
         key = key_from_event(event)
         if key is None:
             return
+        event_counts["key"] += 1
+        if event_counts["key"] == 1 or event_counts["key"] % 20 == 0:
+            print(f"key events: {event_counts['key']} latest={event}", flush=True)
         try:
             if event_type == "key_down":
                 keyboard_controller.press(key)
