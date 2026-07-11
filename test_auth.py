@@ -1,0 +1,52 @@
+import socket
+import threading
+import unittest
+
+from auth import AuthenticationError, authenticate_client, authenticate_server
+
+
+class AuthenticationTests(unittest.TestCase):
+    def test_matching_pairing_codes_authenticate(self) -> None:
+        server, client = socket.socketpair()
+        errors: list[Exception] = []
+
+        def run_server() -> None:
+            try:
+                authenticate_server(server, "123456")
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_server)
+        thread.start()
+        try:
+            authenticate_client(client, "123456")
+        finally:
+            client.close()
+            server.close()
+            thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_wrong_pairing_code_is_rejected(self) -> None:
+        server, client = socket.socketpair()
+
+        def run_server() -> None:
+            try:
+                authenticate_server(server, "123456")
+            except AuthenticationError:
+                server.sendall(b'{"type":"control_mode","enabled":false}\n')
+
+        thread = threading.Thread(target=run_server)
+        thread.start()
+        try:
+            with self.assertRaisesRegex(AuthenticationError, "rejected"):
+                authenticate_client(client, "654321")
+        finally:
+            client.close()
+            server.close()
+            thread.join(timeout=2)
+
+
+if __name__ == "__main__":
+    unittest.main()
