@@ -23,6 +23,7 @@ DEFAULT_DISCOVERY_TIMEOUT = 8.0
 DEFAULT_CLIPBOARD_POLL_INTERVAL = 0.7
 DEFAULT_CLIPBOARD_MAX_BYTES = 262144
 DEFAULT_SEND_QUEUE_SIZE = 2000
+DEFAULT_HEARTBEAT_INTERVAL = 2.0
 REMOTE_MODIFIER_KEYS = {"ctrl", "alt", "cmd", "shift"}
 TOGGLE_KEYS = {"ctrl", "alt", "cmd", "8"}
 
@@ -134,10 +135,12 @@ class EventSender:
         reconnect_delay: float = 2.0,
         send_queue_size: int = DEFAULT_SEND_QUEUE_SIZE,
         pairing_code: str = "",
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
     ) -> None:
         self.resolve_target = resolve_target
         self.pairing_code = pairing_code
         self.reconnect_delay = reconnect_delay
+        self.heartbeat_interval = heartbeat_interval
         self.send_queue: queue.Queue[bytes] = queue.Queue(maxsize=send_queue_size)
         self.host = ""
         self.port = DEFAULT_PORT
@@ -146,9 +149,14 @@ class EventSender:
         self.stop_event = threading.Event()
         self.reconnect_thread: threading.Thread | None = None
         self.writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self.heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            daemon=True,
+        )
         self.reconnect_callback: Callable[[], None] | None = None
         self.incoming_handler: IncomingEventHandler | None = None
         self.writer_thread.start()
+        self.heartbeat_thread.start()
 
     def connect(self, target: tuple[str, int] | None = None) -> None:
         if target is None:
@@ -311,6 +319,13 @@ class EventSender:
                         self._clear_send_queue()
                 self._start_reconnect()
 
+    def _heartbeat_loop(self) -> None:
+        while not self.stop_event.wait(self.heartbeat_interval):
+            with self.lock:
+                connected = self.sock is not None
+            if connected:
+                self.send({"type": "heartbeat"})
+
 
 class MacControllerClient:
     def __init__(
@@ -319,11 +334,15 @@ class MacControllerClient:
         mouse_scale: float,
         map_cmd_to_ctrl: bool,
         debug_keys: bool,
+        auto_switch_edge: str = "off",
+        edge_margin: int = 2,
     ) -> None:
         self.sender = sender
         self.mouse_scale = mouse_scale
         self.map_cmd_to_ctrl = map_cmd_to_ctrl
         self.debug_keys = debug_keys
+        self.auto_switch_edge = auto_switch_edge
+        self.edge_margin = edge_margin
         self.enabled = False
         self.last_mouse_pos: tuple[int, int] | None = None
         self.pressed_keys: set[str] = set()
@@ -428,6 +447,8 @@ class MacControllerClient:
 
     def on_native_mouse_move(self, x: float, y: float, dx: int, dy: int) -> None:
         if not self.is_enabled():
+            if self.try_activate_from_edge(x, dx, y, dy):
+                return
             return
 
         if not dx and not dy:
@@ -447,6 +468,65 @@ class MacControllerClient:
         scaled_dy = dy * self.mouse_scale
         if scaled_dx or scaled_dy:
             self.sender.send({"type": "mouse_move", "dx": scaled_dx, "dy": scaled_dy})
+
+    def set_screen_horizontal_bounds(self, min_x: float, max_x: float) -> None:
+        with self.state_lock:
+            self.screen_min_x = min_x
+            self.screen_max_x = max_x
+
+    def set_screen_vertical_bounds(self, min_y: float, max_y: float) -> None:
+        with self.state_lock:
+            self.screen_min_y = min_y
+            self.screen_max_y = max_y
+
+    def try_activate_from_edge(
+        self,
+        x: float,
+        dx: int,
+        y: float | None = None,
+        dy: int = 0,
+    ) -> bool:
+        with self.state_lock:
+            if self.enabled or self.auto_switch_edge == "off":
+                return False
+            min_x = getattr(self, "screen_min_x", None)
+            max_x = getattr(self, "screen_max_x", None)
+            min_y = getattr(self, "screen_min_y", None)
+            max_y = getattr(self, "screen_max_y", None)
+
+        should_activate = (
+            self.auto_switch_edge == "right"
+            and max_x is not None
+            and dx > 0
+            and x >= max_x - self.edge_margin
+        ) or (
+            self.auto_switch_edge == "left"
+            and min_x is not None
+            and dx < 0
+            and x <= min_x + self.edge_margin
+        ) or (
+            self.auto_switch_edge == "top"
+            and y is not None
+            and min_y is not None
+            and dy < 0
+            and y <= min_y + self.edge_margin
+        ) or (
+            self.auto_switch_edge == "bottom"
+            and y is not None
+            and max_y is not None
+            and dy > 0
+            and y >= max_y - self.edge_margin
+        )
+        if not should_activate:
+            return False
+
+        self.toggle_control_mode()
+        print(
+            f"Activated Windows control from Mac {self.auto_switch_edge} edge. "
+            "Press F8 to return to Mac.",
+            flush=True,
+        )
+        return True
 
     def on_native_mouse_click(self, button: str, pressed: bool) -> None:
         if not self.is_enabled():
@@ -568,6 +648,18 @@ def native_key_event(event_type: str, keycode: int) -> dict[str, Any]:
 
 def run_native_macos_event_tap(client: MacControllerClient) -> None:
     import Quartz
+
+    main_display_bounds = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
+    screen_min_x = float(main_display_bounds.origin.x)
+    client.set_screen_horizontal_bounds(
+        screen_min_x,
+        screen_min_x + float(main_display_bounds.size.width),
+    )
+    screen_min_y = float(main_display_bounds.origin.y)
+    client.set_screen_vertical_bounds(
+        screen_min_y,
+        screen_min_y + float(main_display_bounds.size.height),
+    )
 
     event_types = [
         Quartz.kCGEventKeyDown,
@@ -780,6 +872,18 @@ def parse_args() -> argparse.Namespace:
         help="Multiply Mac mouse movement before sending it to Windows.",
     )
     parser.add_argument(
+        "--auto-switch-edge",
+        choices=("off", "left", "right", "top", "bottom"),
+        default=str(config.get("auto_switch_edge", "off")),
+        help="Automatically enter Windows control at a Mac main-display edge.",
+    )
+    parser.add_argument(
+        "--edge-margin",
+        type=int,
+        default=int(config.get("edge_margin", 2)),
+        help="Distance from the configured screen edge that activates control.",
+    )
+    parser.add_argument(
         "--suppress-local-mouse",
         action=argparse.BooleanOptionalAction,
         default=bool(config.get("suppress_local_mouse", False)),
@@ -802,6 +906,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(config.get("send_queue_size", DEFAULT_SEND_QUEUE_SIZE)),
         help="Maximum number of encoded events waiting for the socket writer.",
+    )
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=float(config.get("heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL)),
+        help="Seconds between connection heartbeat messages.",
     )
     parser.add_argument(
         "--sync-clipboard",
@@ -840,6 +950,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.auto_switch_edge != "off" and (
+        sys.platform != "darwin" or not args.suppress_local_mouse
+    ):
+        print(
+            "WARNING: edge switching requires macOS native input suppression; "
+            "edge switching is disabled for this run.",
+            flush=True,
+        )
+        args.auto_switch_edge = "off"
     print(f"CrossKey Mac v{__version__}", flush=True)
     resolve_target = make_connection_target_resolver(args)
     initial_target = resolve_target()
@@ -853,6 +972,7 @@ def main() -> None:
         resolve_target,
         send_queue_size=args.send_queue_size,
         pairing_code=args.pairing_code,
+        heartbeat_interval=args.heartbeat_interval,
     )
     initial_host, initial_port = initial_target
     print(f"Connecting to Windows at {initial_host}:{initial_port}...", flush=True)
@@ -879,12 +999,20 @@ def main() -> None:
         print("Mac Command is mapped to Windows Ctrl for shortcuts.", flush=True)
     if args.debug_keys:
         print("Keyboard debug logging is ON.", flush=True)
+    if args.auto_switch_edge != "off":
+        print(
+            f"Mac {args.auto_switch_edge} edge activates Windows control; "
+            "F8 returns to Mac.",
+            flush=True,
+        )
 
     client = MacControllerClient(
         sender,
         args.mouse_scale,
         args.map_cmd_to_ctrl,
         args.debug_keys,
+        args.auto_switch_edge,
+        args.edge_margin,
     )
     clipboard_sync = ClipboardSync(
         sender.send,

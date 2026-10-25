@@ -25,6 +25,23 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "port"):
                 load_settings(path)
 
+    def test_heartbeat_timeout_must_exceed_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(
+                '{"heartbeat_interval":5,"heartbeat_timeout":5}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "heartbeat_timeout"):
+                load_settings(path)
+
+    def test_invalid_auto_switch_edge_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text('{"auto_switch_edge":"diagonal"}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "auto_switch_edge"):
+                load_settings(path)
+
     def test_settings_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

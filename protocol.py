@@ -17,6 +17,7 @@ EVENT_TYPES = {
     "auth_ok",
     "clipboard_text",
     "control_mode",
+    "heartbeat",
     "key_down",
     "key_up",
     "mouse_click",

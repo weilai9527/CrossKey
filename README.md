@@ -20,6 +20,7 @@ discovery.py     UDP 自动发现与广播
 config.example.json  不含私密信息的配置示例
 config.json      两端本地配置（自动创建，不提交到 Git）
 configure_ip.py  手动修改 Windows IP/端口
+configure_layout.py  在终端设置 Windows 相对 Mac 的屏幕位置
 check_connection.py  网络和配对诊断
 requirements.txt Python 依赖
 ```
@@ -110,9 +111,13 @@ python3 configure_ip.py --host 192.168.1.25 --port 5050
   "auto_discover": true,
   "discovery_port": 5051,
   "mouse_scale": 1.0,
+  "auto_switch_edge": "off",
+  "edge_margin": 2,
   "suppress_local_mouse": true,
   "map_cmd_to_ctrl": true,
   "debug_keys": false,
+  "heartbeat_interval": 2.0,
+  "heartbeat_timeout": 8.0,
   "sync_clipboard": true,
   "clipboard_only_control_mode": true,
   "clipboard_poll_interval": 0.7,
@@ -149,6 +154,48 @@ python3 mac_client.py --no-discover
 3. Mac 按 `F8`，进入控制 Windows 模式
 4. Mac 触控板移动、左右点击、键盘输入会发送到 Windows
 5. 再按一次 `F8`，退出控制模式
+
+### 从屏幕边缘进入 Windows
+
+像设置扩展显示器一样在终端选择 Windows 位于 Mac 的哪一侧：
+
+```bash
+python3 configure_layout.py
+```
+
+按提示选择：
+
+```text
+1. Windows 在 Mac 右侧
+2. Windows 在 Mac 左侧
+3. Windows 在 Mac 上方
+4. Windows 在 Mac 下方
+5. 关闭边缘切换
+```
+
+也可以不进入交互界面，直接设置：
+
+```bash
+python3 configure_layout.py --position right --edge-margin 2
+python3 configure_layout.py --position left --edge-margin 2
+python3 configure_layout.py --position top --edge-margin 2
+python3 configure_layout.py --position bottom --edge-margin 2
+python3 configure_layout.py --position off
+```
+
+设置会保存到 `config.json`，重启 Mac 客户端后生效。对应的配置内容是：
+
+```json
+"auto_switch_edge": "right",
+"edge_margin": 2
+```
+
+重新启动 Mac 客户端后，把鼠标向 Mac 主显示器右边缘继续推动，就会自动进入 Windows
+控制模式。当前版本使用 `F8` 返回 Mac；`auto_switch_edge` 也支持 `left`、`top` 和
+`bottom`，或设为 `off` 关闭。该功能需要 macOS 原生输入拦截，因此
+`suppress_local_mouse` 必须保持为 `true`。
+
+目前边缘切换按 Mac 主显示器计算，多显示器布局将在后续版本完善。
 
 连接异常时，可以在 Mac 上检查网络和配对认证：
 
@@ -228,6 +275,21 @@ Command + C / Command + V
 ```
 
 退出控制模式或退出脚本后恢复；如果想关闭这个行为，把它改成 `false`。
+
+## 断线保护
+
+Mac 默认每 2 秒发送一次连接心跳。Windows 连续 8 秒收不到消息时会主动结束连接，
+并释放所有由 Mac 按下的键和鼠标按钮。正常退出控制模式、Mac 断开和连接超时也会执行
+同样的释放操作，避免 Ctrl、Shift 或鼠标按钮在 Windows 上卡住。
+
+通常不需要修改；如有特殊网络环境，可以同时调整：
+
+```json
+"heartbeat_interval": 2.0,
+"heartbeat_timeout": 8.0
+```
+
+`heartbeat_timeout` 必须大于 `heartbeat_interval`。
 
 ## 常见问题
 
@@ -309,7 +371,7 @@ Python
 这个 Demo 主要用于证明可行性，暂时不处理：
 
 ```text
-鼠标穿屏
+从 Windows 边缘自动返回 Mac 的完整双向鼠标穿屏
 多显示器坐标映射
 中文输入法完整同步
 图片/文件/富文本剪贴板同步

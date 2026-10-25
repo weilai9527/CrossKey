@@ -18,6 +18,11 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(decoded["protocol_version"], PROTOCOL_VERSION)
         self.assertEqual(decoded["type"], "mouse_move")
 
+    def test_heartbeat_round_trip(self) -> None:
+        event = decode_event(encode_event({"type": "heartbeat"}))
+
+        self.assertEqual(event["type"], "heartbeat")
+
     def test_legacy_event_without_version_is_accepted(self) -> None:
         line = b'{"type":"control_mode","enabled":true}\n'
 

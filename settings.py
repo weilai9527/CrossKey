@@ -16,10 +16,14 @@ DEFAULTS: dict[str, Any] = {
     "discovery_port": 5051,
     "discovery_timeout": 8.0,
     "mouse_scale": 1.0,
+    "auto_switch_edge": "off",
+    "edge_margin": 2,
     "suppress_local_mouse": True,
     "map_cmd_to_ctrl": True,
     "debug_keys": False,
     "send_queue_size": 2000,
+    "heartbeat_interval": 2.0,
+    "heartbeat_timeout": 8.0,
     "sync_clipboard": True,
     "clipboard_only_control_mode": True,
     "clipboard_poll_interval": 0.7,
@@ -55,8 +59,22 @@ def validate_settings(settings: dict[str, Any]) -> None:
         raise ValueError("discovery_timeout must be positive")
     if float(settings["mouse_scale"]) <= 0:
         raise ValueError("mouse_scale must be positive")
+    if settings["auto_switch_edge"] not in {
+        "off",
+        "left",
+        "right",
+        "top",
+        "bottom",
+    }:
+        raise ValueError("auto_switch_edge must be off, left, right, top, or bottom")
+    if not 1 <= int(settings["edge_margin"]) <= 100:
+        raise ValueError("edge_margin must be between 1 and 100")
     if int(settings["send_queue_size"]) <= 0:
         raise ValueError("send_queue_size must be positive")
+    if float(settings["heartbeat_interval"]) <= 0:
+        raise ValueError("heartbeat_interval must be positive")
+    if float(settings["heartbeat_timeout"]) <= float(settings["heartbeat_interval"]):
+        raise ValueError("heartbeat_timeout must be greater than heartbeat_interval")
     if float(settings["clipboard_poll_interval"]) <= 0:
         raise ValueError("clipboard_poll_interval must be positive")
     if int(settings["clipboard_max_bytes"]) <= 0:

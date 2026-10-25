@@ -21,6 +21,7 @@ DEFAULT_PORT = 5050
 DEFAULT_DISCOVERY_PORT = 5051
 DEFAULT_CLIPBOARD_POLL_INTERVAL = 0.7
 DEFAULT_CLIPBOARD_MAX_BYTES = 262144
+DEFAULT_HEARTBEAT_TIMEOUT = 8.0
 
 
 mouse_controller = mouse.Controller()
@@ -31,6 +32,9 @@ event_counts = {
     "key": 0,
 }
 control_mode_enabled = False
+pressed_remote_keys: set[str | keyboard.Key] = set()
+pressed_remote_buttons: set[mouse.Button] = set()
+input_state_lock = threading.Lock()
 
 
 SPECIAL_KEY_ALIASES = {
@@ -101,15 +105,53 @@ def key_from_event(event: dict[str, Any]) -> str | keyboard.Key | None:
     return getattr(keyboard.Key, name, None)
 
 
+def release_all_remote_inputs() -> None:
+    """Release anything the remote Mac left pressed.
+
+    Network loss can otherwise leave Ctrl, Shift, or a mouse button held on Windows
+    until the user presses it locally. Clear the tracked state before calling the
+    controllers so this function remains safe when it is called more than once.
+    """
+    with input_state_lock:
+        keys = tuple(pressed_remote_keys)
+        buttons = tuple(pressed_remote_buttons)
+        pressed_remote_keys.clear()
+        pressed_remote_buttons.clear()
+
+    for key in keys:
+        try:
+            keyboard_controller.release(key)
+        except (ValueError, OSError):
+            pass
+    for button in buttons:
+        try:
+            mouse_controller.release(button)
+        except (ValueError, OSError):
+            pass
+
+    if keys or buttons:
+        print(
+            f"Released remote input state: {len(keys)} key(s), "
+            f"{len(buttons)} mouse button(s)",
+            flush=True,
+        )
+
+
 def handle_event(event: dict[str, Any]) -> None:
     global control_mode_enabled
 
     event_type = event.get("type")
 
     if event_type == "control_mode":
-        control_mode_enabled = bool(event.get("enabled"))
+        enabled = bool(event.get("enabled"))
+        if not enabled:
+            release_all_remote_inputs()
+        control_mode_enabled = enabled
         state = "enabled" if control_mode_enabled else "disabled"
         print(f"Mac control mode {state}", flush=True)
+        return
+
+    if not control_mode_enabled:
         return
 
     if event_type == "mouse_move":
@@ -136,8 +178,12 @@ def handle_event(event: dict[str, Any]) -> None:
         )
         if event.get("pressed"):
             mouse_controller.press(button)
+            with input_state_lock:
+                pressed_remote_buttons.add(button)
         else:
             mouse_controller.release(button)
+            with input_state_lock:
+                pressed_remote_buttons.discard(button)
         return
 
     if event_type == "mouse_scroll":
@@ -157,8 +203,12 @@ def handle_event(event: dict[str, Any]) -> None:
         try:
             if event_type == "key_down":
                 keyboard_controller.press(key)
+                with input_state_lock:
+                    pressed_remote_keys.add(key)
             else:
                 keyboard_controller.release(key)
+                with input_state_lock:
+                    pressed_remote_keys.discard(key)
         except ValueError:
             print(f"Skipped unsupported key: {event}", flush=True)
 
@@ -172,6 +222,7 @@ def handle_client(
     clipboard_poll_interval: float,
     clipboard_max_bytes: int,
     pairing_code: str,
+    heartbeat_timeout: float,
 ) -> None:
     global control_mode_enabled
 
@@ -187,6 +238,7 @@ def handle_client(
         return
     print("Mac authenticated", flush=True)
     print("Now press F8 on Mac, or Control + Option + Command + 8.", flush=True)
+    conn.settimeout(heartbeat_timeout)
     send_lock = threading.Lock()
 
     def send_clipboard_event(event: dict[str, Any]) -> bool:
@@ -223,8 +275,11 @@ def handle_client(
                         handle_event(event)
                 except Exception as exc:
                     print(f"Bad event: {exc}", flush=True)
+        except (OSError, TimeoutError) as exc:
+            print(f"Mac connection ended: {exc}", flush=True)
         finally:
             clipboard_sync.stop()
+            release_all_remote_inputs()
             control_mode_enabled = False
             client_connected.clear()
     print("Mac disconnected", flush=True)
@@ -240,6 +295,7 @@ def serve(
     clipboard_max_bytes: int,
     discovery_port: int,
     pairing_code: str,
+    heartbeat_timeout: float,
 ) -> None:
     client_connected = threading.Event()
     discovery_thread = threading.Thread(
@@ -272,6 +328,7 @@ def serve(
                 clipboard_poll_interval,
                 clipboard_max_bytes,
                 pairing_code,
+                heartbeat_timeout,
             )
 
 
@@ -315,6 +372,12 @@ def parse_args() -> argparse.Namespace:
         default=int(config.get("clipboard_max_bytes", DEFAULT_CLIPBOARD_MAX_BYTES)),
         help="Maximum UTF-8 text size to synchronize.",
     )
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=float,
+        default=float(config.get("heartbeat_timeout", DEFAULT_HEARTBEAT_TIMEOUT)),
+        help="Release remote input after this many seconds without a Mac message.",
+    )
     args = parser.parse_args()
     if not args.pairing_code:
         args.pairing_code = generate_pairing_code()
@@ -335,4 +398,5 @@ if __name__ == "__main__":
         args.clipboard_max_bytes,
         args.discovery_port,
         args.pairing_code,
+        args.heartbeat_timeout,
     )
