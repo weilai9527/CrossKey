@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from auth import validate_pairing_code
+from screen_edges import validate_edge_monitors
 
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -17,6 +18,7 @@ DEFAULTS: dict[str, Any] = {
     "discovery_timeout": 8.0,
     "mouse_scale": 1.0,
     "auto_switch_edge": "off",
+    "edge_monitors": {},
     "edge_margin": 2,
     "suppress_local_mouse": True,
     "map_cmd_to_ctrl": True,
@@ -33,7 +35,7 @@ DEFAULTS: dict[str, Any] = {
 
 
 def load_settings(path: Path = CONFIG_PATH) -> dict[str, Any]:
-    settings = dict(DEFAULTS)
+    settings = dict(DEFAULTS, edge_monitors={})
     if path.exists():
         value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
@@ -69,6 +71,7 @@ def validate_settings(settings: dict[str, Any]) -> None:
         raise ValueError("auto_switch_edge must be off, left, right, top, or bottom")
     if not 1 <= int(settings["edge_margin"]) <= 100:
         raise ValueError("edge_margin must be between 1 and 100")
+    validate_edge_monitors(settings.get("edge_monitors", {}))
     if int(settings["send_queue_size"]) <= 0:
         raise ValueError("send_queue_size must be positive")
     if float(settings["heartbeat_interval"]) <= 0:

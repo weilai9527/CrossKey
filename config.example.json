@@ -7,6 +7,7 @@
   "discovery_timeout": 8.0,
   "mouse_scale": 1.0,
   "auto_switch_edge": "off",
+  "edge_monitors": {},
   "edge_margin": 2,
   "suppress_local_mouse": true,
   "map_cmd_to_ctrl": true,

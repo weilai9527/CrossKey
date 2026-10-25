@@ -4,6 +4,16 @@ from screen_edges import OPPOSITE_EDGE, ScreenBounds
 
 
 class ScreenGeometryTests(unittest.TestCase):
+    def test_segment_intersection_handles_negative_coordinates_and_large_moves(self) -> None:
+        bounds = ScreenBounds(-1920, -1080, 0, 0)
+        self.assertAlmostEqual(bounds.exit_fraction("bottom", -960, -11, 40, 100, 2),
+                               (960 + 3.2) / 1919)
+        self.assertIsNone(bounds.exit_fraction("bottom", -960, -11, 0, -10, 2))
+        self.assertIsNone(bounds.exit_fraction("bottom", -960, -11, 0, 0, 2))
+        # This segment exits through the right edge before reaching the bottom.
+        self.assertIsNone(bounds.exit_fraction("bottom", -1, -100, 100, 100, 2))
+        self.assertIsNone(bounds.exit_fraction("bottom", 100, 100, 0, 10, 2))
+
     def test_all_edges_require_outward_movement(self) -> None:
         bounds = ScreenBounds(0, 0, 1920, 1080)
         cases = (("left", 0, 500, -1, 0), ("right", 1919, 500, 1, 0),

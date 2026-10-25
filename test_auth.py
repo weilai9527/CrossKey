@@ -12,14 +12,15 @@ class AuthenticationTests(unittest.TestCase):
 
         def run_server() -> None:
             try:
-                authenticate_server(server, "123456")
+                authenticate_server(server, "123456", capabilities=("monitor_mapping_v1",))
             except Exception as exc:
                 errors.append(exc)
 
         thread = threading.Thread(target=run_server)
         thread.start()
         try:
-            authenticate_client(client, "123456")
+            result = authenticate_client(client, "123456")
+            self.assertEqual(result["capabilities"], ["monitor_mapping_v1"])
         finally:
             client.close()
             server.close()

@@ -15,7 +15,7 @@ from auth import AuthenticationError, authenticate_client
 from clipboard_sync import ClipboardSync
 from discovery import discover_receiver
 from protocol import MAX_EVENT_LINE_BYTES, decode_event, encode_event
-from screen_edges import ScreenBounds
+from screen_edges import EDGE_ORDER, ScreenBounds, validate_edge_monitors
 from settings import load_settings
 from version import __version__
 
@@ -148,6 +148,7 @@ class EventSender:
         self.host = ""
         self.port = DEFAULT_PORT
         self.sock: socket.socket | None = None
+        self.capabilities: set[str] = set()
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.reconnect_thread: threading.Thread | None = None
@@ -170,7 +171,7 @@ class EventSender:
         host, port = target
         sock = socket.create_connection((host, port), timeout=10)
         try:
-            authenticate_client(sock, self.pairing_code)
+            result = authenticate_client(sock, self.pairing_code)
         except Exception:
             sock.close()
             raise
@@ -181,12 +182,16 @@ class EventSender:
             self.host = host
             self.port = port
             self.sock = sock
+            self.capabilities = set(result.get("capabilities", []))
         self._start_reader(sock)
 
     def send(self, event: dict[str, Any]) -> bool:
         data = encode_event(event)
         with self.lock:
             sock = self.sock
+            if "edge_monitors" in event and "monitor_mapping_v1" not in self.capabilities:
+                print("Multi-monitor mapping requires Windows receiver v0.5.0 or newer.", flush=True)
+                return False
         if sock is None:
             self._start_reconnect()
             return False
@@ -213,6 +218,10 @@ class EventSender:
     def _close_socket_locked(self) -> None:
         if self.sock is None:
             return
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             self.sock.close()
         finally:
@@ -339,6 +348,7 @@ class MacControllerClient:
         debug_keys: bool,
         auto_switch_edge: str = "off",
         edge_margin: int = 2,
+        edge_monitors: dict[str, int] | None = None,
     ) -> None:
         self.sender = sender
         self.mouse_scale = mouse_scale
@@ -346,6 +356,9 @@ class MacControllerClient:
         self.debug_keys = debug_keys
         self.auto_switch_edge = auto_switch_edge
         self.edge_margin = edge_margin
+        self.edge_monitors = validate_edge_monitors(edge_monitors or {})
+        self.active_edge = next((edge for edge in EDGE_ORDER if edge in self.edge_monitors),
+                                auto_switch_edge)
         self.enabled = False
         self.last_mouse_pos: tuple[int, int] | None = None
         self.pressed_keys: set[str] = set()
@@ -366,16 +379,20 @@ class MacControllerClient:
         event: dict[str, Any] = {
             "type": "control_mode", "enabled": enabled, "session_id": self.session_id
         }
-        if enabled and self.auto_switch_edge != "off" and self.screen_bounds() is not None:
-            event.update(edge=self.auto_switch_edge, edge_margin=self.edge_margin)
+        if enabled and self.active_edge != "off" and self.screen_bounds() is not None:
+            event.update(edge=self.active_edge, edge_margin=self.edge_margin)
+            if self.edge_monitors:
+                event["edge_monitors"] = dict(self.edge_monitors)
             if position is not None:
                 event["position"] = position
         return event
 
-    def toggle_control_mode(self, position: float | None = None) -> bool:
+    def toggle_control_mode(self, position: float | None = None, edge: str | None = None) -> bool:
         with self.state_lock:
             enabled = not self.enabled
             if enabled:
+                if edge is not None:
+                    self.active_edge = edge
                 self.session_id = uuid.uuid4().hex
             # Never capture local input if the activation cannot be queued.
             if not self.sender.send(self.control_event(enabled, position)) and enabled:
@@ -390,11 +407,14 @@ class MacControllerClient:
         return True
 
     def handle_remote_event(self, event: dict[str, Any]) -> None:
-        if event.get("type") != "return_control":
+        if event.get("type") not in {"return_control", "control_rejected"}:
             return
         with self.state_lock:
-            if (not self.enabled or event["session_id"] != self.session_id
-                    or event["edge"] != self.auto_switch_edge):
+            if not self.enabled or event["session_id"] != self.session_id:
+                return
+            rejected = event["type"] == "control_rejected"
+            allowed_edges = self.edge_monitors or {self.auto_switch_edge: None}
+            if not rejected and event["edge"] not in allowed_edges:
                 return
             bounds = self.screen_bounds()
             self.enabled = False
@@ -403,14 +423,19 @@ class MacControllerClient:
             self.edge_cooldown_until = time.monotonic() + 0.25
             # Windows already stopped accepting input and released held buttons.
             # Warp while holding the same lock as the native event callback.
-            if bounds is not None and self.warp_cursor is not None:
+            if not rejected:
+                self.active_edge = event["edge"]
+            if not rejected and bounds is not None and self.warp_cursor is not None:
                 try:
                     self.warp_cursor(bounds.landing(
-                        self.auto_switch_edge, event["position"], self.edge_margin
+                        self.active_edge, event["position"], self.edge_margin
                     ))
                 except Exception as exc:
                     print(f"Could not reposition Mac cursor: {exc}", flush=True)
-        print("Returned to Mac from Windows screen edge.", flush=True)
+        if rejected:
+            print(f"Windows rejected layout: {event['reason']}", flush=True)
+        else:
+            print("Returned to Mac from Windows screen edge.", flush=True)
 
     def is_enabled(self) -> bool:
         with self.state_lock:
@@ -481,7 +506,10 @@ class MacControllerClient:
             if not self.enabled:
                 return
             self.session_id = uuid.uuid4().hex
-            self.sender.send(self.control_event(True))
+            if not self.sender.send(self.control_event(True)):
+                self.enabled = False
+                self.edge_cooldown_until = time.monotonic() + 0.25
+                return
             self.release_remote_modifiers()
 
     def send_key_event(self, event: dict[str, Any]) -> None:
@@ -540,7 +568,7 @@ class MacControllerClient:
         dy: int = 0,
     ) -> bool:
         with self.state_lock:
-            if (self.enabled or self.auto_switch_edge == "off"
+            if (self.enabled or (not self.edge_monitors and self.auto_switch_edge == "off")
                     or time.monotonic() < self.edge_cooldown_until):
                 return False
             bounds = self.screen_bounds()
@@ -548,15 +576,21 @@ class MacControllerClient:
                 return False
             if y is None:
                 y = (bounds.top + bounds.bottom - 1) / 2
-            if not bounds.contains(x, y) or not bounds.crossing(
-                self.auto_switch_edge, x, y, dx, dy, self.edge_margin
-            ):
+            if not bounds.contains(x, y):
                 return False
-            position = bounds.fraction(self.auto_switch_edge, x, y)
-            if not self.toggle_control_mode(position):
+            edges = self.edge_monitors or {self.auto_switch_edge: None}
+            candidates = [edge for edge in EDGE_ORDER if edge in edges and bounds.crossing(
+                edge, x, y, dx, dy, self.edge_margin
+            )]
+            if not candidates:
+                return False
+            # At a corner, prefer the direction with the larger outward delta.
+            edge = max(candidates, key=lambda item: abs(dx) if item in {"left", "right"} else abs(dy))
+            position = bounds.fraction(edge, x, y)
+            if not self.toggle_control_mode(position, edge):
                 return False
         print(
-            f"Activated Windows control from Mac {self.auto_switch_edge} edge. "
+            f"Activated Windows control from Mac {edge} edge. "
             "Move back across the Windows edge or press F8 to return.",
             flush=True,
         )
@@ -920,7 +954,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--auto-switch-edge",
         choices=("off", "left", "right", "top", "bottom"),
-        default=str(config.get("auto_switch_edge", "off")),
+        default=None,
         help="Automatically enter Windows control at a Mac main-display edge.",
     )
     parser.add_argument(
@@ -986,6 +1020,13 @@ def parse_args() -> argparse.Namespace:
         help="Maximum UTF-8 text size to synchronize.",
     )
     args = parser.parse_args()
+    # An explicit single-edge override also disables any saved multi-screen map.
+    edge_override = args.auto_switch_edge is not None
+    args.edge_monitors = {} if edge_override else dict(config.get("edge_monitors", {}))
+    if not edge_override:
+        args.auto_switch_edge = str(config.get("auto_switch_edge", "off"))
+    if not 1 <= args.edge_margin <= 100:
+        parser.error("edge-margin must be between 1 and 100")
     args.host_from_cli = args.host is not None
     args.host = args.host if args.host is not None else config.get("windows_host")
     args.port = args.port if args.port is not None else int(config.get("port", DEFAULT_PORT))
@@ -996,7 +1037,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.auto_switch_edge != "off" and (
+    if (args.auto_switch_edge != "off" or args.edge_monitors) and (
         sys.platform != "darwin" or not args.suppress_local_mouse
     ):
         print(
@@ -1005,6 +1046,7 @@ def main() -> None:
             flush=True,
         )
         args.auto_switch_edge = "off"
+        args.edge_monitors = {}
     print(f"CrossKey Mac v{__version__}", flush=True)
     resolve_target = make_connection_target_resolver(args)
     initial_target = resolve_target()
@@ -1025,6 +1067,7 @@ def main() -> None:
     try:
         sender.connect(initial_target)
     except (OSError, AuthenticationError, ValueError) as exc:
+        sender.close()
         print("", flush=True)
         print(f"ERROR: Cannot connect to Windows: {exc}", flush=True)
         print("", flush=True)
@@ -1034,6 +1077,10 @@ def main() -> None:
         print(f"3. Windows 当前 IP 是否还是 {initial_host}", flush=True)
         print("4. Mac 和 Windows 是否还在同一个局域网/Wi-Fi", flush=True)
         return
+    if args.edge_monitors and "monitor_mapping_v1" not in sender.capabilities:
+        sender.close()
+        raise SystemExit("Multi-monitor mapping requires Windows receiver v0.5.0 or newer. "
+                         "Update and restart win_server.py first.")
     print("Connected and authenticated with Windows", flush=True)
     print("Press F8 to control Windows. Press F8 again to stop.", flush=True)
     print("If F8 is a media key, use Control + Option + Command + 8.", flush=True)
@@ -1045,7 +1092,11 @@ def main() -> None:
         print("Mac Command is mapped to Windows Ctrl for shortcuts.", flush=True)
     if args.debug_keys:
         print("Keyboard debug logging is ON.", flush=True)
-    if args.auto_switch_edge != "off":
+    if args.edge_monitors:
+        for edge in EDGE_ORDER:
+            if edge in args.edge_monitors:
+                print(f"Mac {edge} edge -> Windows monitor {args.edge_monitors[edge]}", flush=True)
+    elif args.auto_switch_edge != "off":
         print(
             f"Mac {args.auto_switch_edge} edge activates Windows control; "
             "the opposite Windows edge or F8 returns to Mac.",
@@ -1059,6 +1110,7 @@ def main() -> None:
         args.debug_keys,
         args.auto_switch_edge,
         args.edge_margin,
+        args.edge_monitors,
     )
     clipboard_sync = ClipboardSync(
         sender.send,
@@ -1072,7 +1124,7 @@ def main() -> None:
     )
     sender.set_reconnect_callback(client.recover_remote_state_after_reconnect)
     def handle_incoming_event(event: dict[str, Any]) -> None:
-        if event.get("type") == "return_control":
+        if event.get("type") in {"return_control", "control_rejected"}:
             client.handle_remote_event(event)
         else:
             clipboard_sync.handle_remote_event(event)

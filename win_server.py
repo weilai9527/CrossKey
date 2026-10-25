@@ -14,9 +14,10 @@ from auth import AuthenticationError, authenticate_server, generate_pairing_code
 from clipboard_sync import ClipboardSync
 from discovery import broadcast_receiver
 from protocol import MAX_EVENT_LINE_BYTES, decode_event, encode_event
-from screen_edges import OPPOSITE_EDGE, ScreenBounds
+from screen_edges import EDGE_ORDER, OPPOSITE_EDGE, ScreenBounds
 from settings import load_settings, save_settings
 from version import __version__
+from windows_monitors import WindowsMonitor, describe_monitors, enable_dpi_awareness, list_monitors
 
 
 DEFAULT_HOST = "0.0.0.0"
@@ -28,8 +29,7 @@ DEFAULT_HEARTBEAT_TIMEOUT = 8.0
 
 
 # Keep primary-screen metrics and cursor coordinates in the same pixel space.
-if sys.platform == "win32":
-    ctypes.windll.user32.SetProcessDPIAware()
+enable_dpi_awareness()
 
 mouse_controller = mouse.Controller()
 keyboard_controller = keyboard.Controller()
@@ -234,13 +234,25 @@ class EdgeReturnController:
     """Per-connection layout and return state; all input runs on the reader thread."""
 
     def __init__(self, send: Callable[[dict[str, Any]], bool],
-                 get_bounds: Callable[[], ScreenBounds] | None = None) -> None:
+                 get_bounds: Callable[[], ScreenBounds] | None = None,
+                 get_monitors: Callable[[], dict[int, WindowsMonitor]] | None = None) -> None:
         self.send = send
         self.get_bounds = get_bounds or primary_screen_bounds
+        self.get_monitors = get_monitors or list_monitors
+        self.routes: dict[str, ScreenBounds] = {}
         self.mac_edge: str | None = None
         self.bounds: ScreenBounds | None = None
         self.session_id = ""
         self.margin = 2
+
+    def return_to_mac(self, edge: str, position: float) -> bool:
+        global control_mode_enabled
+        control_mode_enabled = False
+        release_all_remote_inputs()
+        self.mac_edge = None
+        self.routes = {}
+        return self.send({"type": "return_control", "session_id": self.session_id,
+                          "edge": edge, "position": position})
 
     def handle(self, event: dict[str, Any]) -> bool:
         global control_mode_enabled
@@ -248,6 +260,30 @@ class EdgeReturnController:
         if event["type"] == "control_mode":
             self.mac_edge = None
             self.bounds = None
+            self.routes = {}
+            if event["enabled"] and event.get("edge_monitors"):
+                try:
+                    monitors = self.get_monitors()
+                    mappings = event["edge_monitors"]
+                    missing = sorted(set(mappings.values()) - monitors.keys())
+                    if missing:
+                        raise OSError(f"Monitor(s) {missing} unavailable; active numbers: {sorted(monitors)}")
+                    routes = {edge: monitors[number].bounds for edge, number in mappings.items()}
+                    bounds = routes[event["edge"]]
+                    mouse_controller.position = bounds.landing(
+                        OPPOSITE_EDGE[event["edge"]], event.get("position", 0.5), event["edge_margin"]
+                    )
+                except OSError as exc:
+                    control_mode_enabled = False
+                    release_all_remote_inputs()
+                    print(f"Layout rejected: {exc}", flush=True)
+                    return self.send({"type": "control_rejected", "session_id": event["session_id"],
+                                      "reason": str(exc)[:256] or "Monitor unavailable"})
+                self.routes = routes
+                self.session_id = event["session_id"]
+                self.margin = event["edge_margin"]
+                handle_event(event)
+                return True
             handle_event(event)
             if event["enabled"] and "edge" in event:
                 try:
@@ -265,6 +301,21 @@ class EdgeReturnController:
                     self.margin = event["edge_margin"]
             return True
 
+        if event["type"] == "mouse_move" and control_mode_enabled and self.routes:
+            x, y = mouse_controller.position
+            dx, dy = (int(round(float(event[name]))) for name in ("dx", "dy"))
+            for edge in EDGE_ORDER:
+                if edge not in self.routes:
+                    continue
+                position = self.routes[edge].exit_fraction(
+                    OPPOSITE_EDGE[edge], x, y, dx, dy, self.margin
+                )
+                if position is not None:
+                    # Intercept before Windows can move onto an adjacent monitor.
+                    return self.return_to_mac(edge, position)
+            handle_event(event)
+            return True
+
         if (event["type"] != "mouse_move" or not control_mode_enabled
                 or self.bounds is None or self.mac_edge is None):
             handle_event(event)
@@ -278,14 +329,7 @@ class EdgeReturnController:
                 edge, x, y, event["dx"], event["dy"], self.margin)):
             # Stop consuming queued input BEFORE notifying Mac. A fresh enable
             # message is required to begin another control session.
-            control_mode_enabled = False
-            release_all_remote_inputs()
-            return_event = {
-                "type": "return_control", "session_id": self.session_id,
-                "edge": self.mac_edge, "position": self.bounds.fraction(edge, x, y),
-            }
-            self.mac_edge = None
-            return self.send(return_event)
+            return self.return_to_mac(self.mac_edge, self.bounds.fraction(edge, x, y))
         return True
 
 
@@ -305,7 +349,7 @@ def handle_client(
     control_mode_enabled = False
     print(f"Mac connected from {address[0]}:{address[1]}", flush=True)
     try:
-        authenticate_server(conn, pairing_code)
+        authenticate_server(conn, pairing_code, capabilities=("monitor_mapping_v1",))
     except (AuthenticationError, OSError, ValueError) as exc:
         print(f"Authentication failed for {address[0]}: {exc}", flush=True)
         conn.close()
@@ -413,6 +457,8 @@ def serve(
 def parse_args() -> argparse.Namespace:
     config = load_settings()
     parser = argparse.ArgumentParser(description="Receive Mac input events on Windows.")
+    parser.add_argument("--list-monitors", action="store_true",
+                        help="Print active Windows monitor numbers and coordinates, then exit.")
     parser.add_argument("--host", default=str(config.get("host", DEFAULT_HOST)))
     parser.add_argument("--port", type=int, default=int(config.get("port", DEFAULT_PORT)))
     parser.add_argument(
@@ -457,6 +503,8 @@ def parse_args() -> argparse.Namespace:
         help="Release remote input after this many seconds without a Mac message.",
     )
     args = parser.parse_args()
+    if args.list_monitors:
+        return args
     if not args.pairing_code:
         args.pairing_code = generate_pairing_code()
         config["pairing_code"] = args.pairing_code
@@ -465,8 +513,15 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-if __name__ == "__main__":
+def main() -> None:
     args = parse_args()
+    if args.list_monitors:
+        try:
+            for line in describe_monitors(list_monitors()):
+                print(line)
+        except OSError as exc:
+            raise SystemExit(str(exc)) from exc
+        return
     serve(
         args.host,
         args.port,
@@ -478,3 +533,7 @@ if __name__ == "__main__":
         args.pairing_code,
         args.heartbeat_timeout,
     )
+
+
+if __name__ == "__main__":
+    main()

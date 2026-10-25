@@ -6,6 +6,8 @@ import json
 import math
 from typing import Any
 
+from screen_edges import validate_edge_monitors
+
 
 ENCODING = "utf-8"
 PROTOCOL_VERSION = 1
@@ -19,6 +21,7 @@ EVENT_TYPES = {
     "control_mode",
     "heartbeat",
     "return_control",
+    "control_rejected",
     "key_down",
     "key_up",
     "mouse_click",
@@ -80,6 +83,19 @@ def validate_event(event: dict[str, Any]) -> None:
             _require_number(event, "position")
             if not 0 <= event["position"] <= 1:
                 raise ValueError("position must be between 0 and 1")
+        if "edge_monitors" in event:
+            mappings = validate_edge_monitors(event["edge_monitors"])
+            if not event["enabled"] or not mappings or event.get("edge") not in mappings:
+                raise ValueError("edge_monitors requires an enabled control session and mapped edge")
+    elif event_type == "control_rejected":
+        _require_string(event, "session_id", max_length=64)
+        _require_string(event, "reason", max_length=256)
+    elif event_type == "auth_ok" and "capabilities" in event:
+        capabilities = event["capabilities"]
+        if (not isinstance(capabilities, list) or len(capabilities) > 32
+                or any(not isinstance(item, str) or not 1 <= len(item) <= 64
+                       for item in capabilities)):
+            raise ValueError("invalid capabilities")
     elif event_type == "return_control":
         _require_string(event, "session_id", max_length=64)
         _require_string(event, "edge", max_length=16)

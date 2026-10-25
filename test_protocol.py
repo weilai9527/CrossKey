@@ -10,6 +10,28 @@ from protocol import (
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_multi_monitor_events_and_rejections_round_trip(self) -> None:
+        events = (
+            {"type": "control_mode", "enabled": True, "edge": "top", "edge_margin": 2,
+             "edge_monitors": {"top": 1, "right": 2}, "position": 0.25, "session_id": "current"},
+            {"type": "control_rejected", "reason": "Monitor 2 unavailable", "session_id": "current"},
+            {"type": "auth_ok", "capabilities": ["monitor_mapping_v1"]},
+        )
+        for event in events:
+            self.assertEqual(decode_event(encode_event(event)), dict(event, protocol_version=1))
+
+    def test_invalid_monitor_protocol_is_rejected(self) -> None:
+        event = {"type": "control_mode", "enabled": True, "edge": "top", "edge_margin": 2,
+                 "session_id": "current", "edge_monitors": {"top": 1, "right": 2}}
+        for mapping in ({}, {"right": 2}, {"top": True}, {"top": "1"}, {"top": 0}, []):
+            with self.subTest(mapping=mapping), self.assertRaises(ValueError):
+                encode_event(dict(event, edge_monitors=mapping))
+        with self.assertRaises(ValueError):
+            encode_event(dict(event, enabled=False))
+        for caps in ("monitor_mapping_v1", [None], ["x" * 65]):
+            with self.assertRaises(ValueError):
+                encode_event({"type": "auth_ok", "capabilities": caps})
+
     def test_round_trip_adds_protocol_version(self) -> None:
         event = {"type": "mouse_move", "dx": 2.5, "dy": -3}
 

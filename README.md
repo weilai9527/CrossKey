@@ -22,6 +22,7 @@ config.json      两端本地配置（自动创建，不提交到 Git）
 configure_ip.py  手动修改 Windows IP/端口
 configure_layout.py  在终端设置 Windows 相对 Mac 的屏幕位置
 screen_edges.py  双向穿屏的边缘检测与落点比例映射
+windows_monitors.py  Windows 显示设备编号、坐标与 DPI 处理
 check_connection.py  网络和配对诊断
 requirements.txt Python 依赖
 ```
@@ -113,6 +114,7 @@ python3 configure_ip.py --host 192.168.1.25 --port 5050
   "discovery_port": 5051,
   "mouse_scale": 1.0,
   "auto_switch_edge": "off",
+  "edge_monitors": {},
   "edge_margin": 2,
   "suppress_local_mouse": true,
   "map_cmd_to_ctrl": true,
@@ -172,6 +174,7 @@ python3 configure_layout.py
 3. Windows 在 Mac 上方
 4. Windows 在 Mac 下方
 5. 关闭边缘切换
+6. 按 Windows 显示器编号映射多个边缘
 ```
 
 也可以不进入交互界面，直接设置：
@@ -214,8 +217,69 @@ python3 configure_layout.py --position off
 该功能需要 macOS 原生输入拦截，因此 `suppress_local_mouse` 必须保持为 `true`。
 旧版 Windows 接收端仍可用 F8 返回，但不支持自动返回。
 
-目前两端均按主显示器计算，不支持多显示器布局映射。更改屏幕分辨率或主显示器后，
-请重启两端程序。穿屏使用 Mac 的鼠标/触控板；Windows 本机鼠标不会反向控制 Mac。
+单方向模式默认使用两端的主显示器。穿屏使用 Mac 的鼠标/触控板；Windows 本机鼠标
+不会反向控制 Mac。
+
+### 多显示器映射：上方 1 号屏、右侧 2 号屏
+
+此功能要求 Mac 和 Windows **都更新到 v0.5.0 或更新版本并重启**。Windows 使用
+“扩展这些显示器”模式。在 Mac 执行：
+
+```bash
+python3 configure_layout.py --map top=1 --map right=2
+python3 mac_client.py
+```
+
+如已保存手动 IP，也可以直接连接，跳过自动发现：
+
+```bash
+python3 mac_client.py --host 192.168.0.104
+```
+
+不要附加旧的 `--auto-switch-edge right` 参数，该参数会临时覆盖多屏映射。
+配置保存到 Mac 本地 `config.json`，进入控制模式时自动传给 Windows：
+
+```json
+"auto_switch_edge": "off",
+"edge_monitors": {"top": 1, "right": 2},
+"edge_margin": 2
+```
+
+| Mac 出口 | Windows 入口 | 返回 Mac 的出口 |
+| --- | --- | --- |
+| 上边缘 | 1 号屏下方 | 1 号屏下边缘 → Mac 上方 |
+| 右边缘 | 2 号屏左侧 | 2 号屏左边缘 → Mac 右侧 |
+
+映射按显示器的完整桌面坐标计算，支持负坐标和不同分辨率；Windows 端启用每显示器 DPI
+感知，使屏幕边界与鼠标坐标一致。Windows 两块屏之间仍按系统的排列移动，
+从任一已映射屏幕的相邻边缘都能返回 Mac，不局限于最初进入的屏幕。
+在 Mac 右上角触发时，优先选择移动量更大的方向；相同时优先上边缘。
+多屏模式下 F8 进入上次使用的映射屏幕，首次默认选择上、右、下、左顺序中的第一个。
+
+可在 Windows 查看程序识别到的屏幕编号：
+
+```cmd
+python win_server.py --list-monitors
+```
+
+输出含编号、设备名、分辨率、桌面位置和主屏标记。程序以 `\\.\DISPLAY1`、
+`\\.\DISPLAY2` 等设备名的数字作为编号，不按枚举顺序编号。若 Windows 设置中的
+“标识”编号与设备名不同，请以此命令的输出核对分辨率和位置，再调整 `--map`。
+指定的屏幕不存在或屏幕信息读取失败时，本次控制会被拒绝并恢复 Mac 输入，不会跳到主屏。
+连接旧版接收端时，Mac 会提示更新而不启用多屏控制。
+
+每次 `--map` 命令替换整份映射；`--edge-margin` 单独使用时保留映射。
+直接运行 `python3 configure_layout.py`，选择菜单 6 也可逐边设置屏幕编号。
+改回单方向模式或关闭所有边缘切换：
+
+```bash
+python3 configure_layout.py --position right
+python3 configure_layout.py --position off
+```
+
+上述 `--position` 命令会清除多屏映射。设置变更后重启 Mac 客户端。
+Windows 屏幕信息会在每次进入时重新读取；在控制期间插拔屏幕或调整排列/缩放后，
+先按 F8 返回再重新进入。Mac 端仍以主显示器为入口，更改 Mac 主显示器或分辨率后需重启客户端。
 
 连接异常时，可以在 Mac 上检查网络和配对认证：
 
@@ -391,7 +455,7 @@ Python
 这个 Demo 主要用于证明可行性，暂时不处理：
 
 ```text
-多显示器坐标映射
+Mac 多显示器入口、每个边缘的局部连接区域和物理尺寸校准
 中文输入法完整同步
 图片/文件/富文本剪贴板同步
 托盘图标
@@ -416,7 +480,8 @@ python3 -m unittest discover -v
 ```
 
 测试覆盖协议边界、版本兼容、配对握手、共享配置、发现消息解析、四方向双向穿屏、
-不同分辨率落点、返回防抖、过期通知、重连与按键释放，并包含已认证 socket 的往返集成测试。
+多屏编号映射、负坐标、共享边界、错误编号、不同分辨率落点、返回防抖、过期通知、
+重连与按键释放，并包含已认证 socket 的多屏往返集成测试。
 测试中的鼠标/键盘控制器使用替身；真实 macOS 权限、Windows 显示缩放与跨机器手感仍需真机验收。
 
 ## 打包

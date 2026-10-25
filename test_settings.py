@@ -48,6 +48,15 @@ class SettingsTests(unittest.TestCase):
             save_settings({"pairing_code": "123456"}, path)
             self.assertEqual(load_settings(path)["pairing_code"], "123456")
 
+    def test_multi_monitor_settings_round_trip_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            save_settings({"edge_monitors": {"top": 1, "right": 2}}, path)
+            self.assertEqual(load_settings(path)["edge_monitors"], {"top": 1, "right": 2})
+            for mapping in ([], None, {"top": True}, {"right": "2"}, {"top": 0}, {"off": 1}):
+                with self.subTest(mapping=mapping), self.assertRaises(ValueError):
+                    save_settings({"edge_monitors": mapping}, path)
+
     def test_discovery_announcement_validation(self) -> None:
         data = json.dumps({"app": "mac-control-windows", "tcp_port": 5050}).encode()
         self.assertEqual(parse_announcement(data, "192.168.1.8"), ("192.168.1.8", 5050))

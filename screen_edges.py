@@ -6,6 +6,18 @@ from dataclasses import dataclass
 
 
 OPPOSITE_EDGE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
+EDGE_ORDER = ("top", "right", "bottom", "left")
+
+
+def validate_edge_monitors(value: object) -> dict[str, int]:
+    if not isinstance(value, dict) or len(value) > 4:
+        raise ValueError("edge_monitors must be an object mapping up to four edges to monitor numbers")
+    for edge, number in value.items():
+        if edge not in OPPOSITE_EDGE:
+            raise ValueError("edge_monitors keys must be left, right, top, or bottom")
+        if type(number) is not int or not 1 <= number <= 65535:
+            raise ValueError("monitor numbers must be integers between 1 and 65535")
+    return dict(value)
 
 
 @dataclass(frozen=True)
@@ -52,3 +64,30 @@ class ScreenBounds:
         else:
             raise ValueError(f"Unknown screen edge: {edge}")
         return round(x), round(y)
+
+    def exit_fraction(self, edge: str, x: float, y: float, dx: float, dy: float,
+                      margin: int) -> float | None:
+        """Intersect an outward movement with the trigger band before moving.
+
+        Checking the segment, rather than the final cursor position, also works
+        when the destination is an adjacent monitor or a gap in the desktop.
+        """
+        if not self.contains(x, y):
+            return None
+        if edge in {"left", "right"}:
+            if (edge == "left" and dx >= 0) or (edge == "right" and dx <= 0):
+                return None
+            boundary = self.left + margin if edge == "left" else self.right - 1 - margin
+            t = max(0.0, (boundary - x) / dx)
+            cross_y = y + t * dy
+            if t <= 1 and self.top <= cross_y < self.bottom:
+                return self.fraction(edge, x, cross_y)
+        elif edge in {"top", "bottom"}:
+            if (edge == "top" and dy >= 0) or (edge == "bottom" and dy <= 0):
+                return None
+            boundary = self.top + margin if edge == "top" else self.bottom - 1 - margin
+            t = max(0.0, (boundary - y) / dy)
+            cross_x = x + t * dx
+            if t <= 1 and self.left <= cross_x < self.right:
+                return self.fraction(edge, cross_x, y)
+        return None
