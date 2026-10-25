@@ -5,6 +5,8 @@ import queue
 import socket
 import sys
 import threading
+import time
+import uuid
 from typing import Any, Callable
 
 from pynput import keyboard, mouse
@@ -13,6 +15,7 @@ from auth import AuthenticationError, authenticate_client
 from clipboard_sync import ClipboardSync
 from discovery import discover_receiver
 from protocol import MAX_EVENT_LINE_BYTES, decode_event, encode_event
+from screen_edges import ScreenBounds
 from settings import load_settings
 from version import __version__
 
@@ -346,17 +349,68 @@ class MacControllerClient:
         self.enabled = False
         self.last_mouse_pos: tuple[int, int] | None = None
         self.pressed_keys: set[str] = set()
-        self.state_lock = threading.Lock()
+        self.state_lock = threading.RLock()
+        self.session_id = ""
+        self.edge_cooldown_until = 0.0
+        self.warp_cursor: Callable[[tuple[int, int]], None] | None = None
 
-    def toggle_control_mode(self) -> None:
+    def screen_bounds(self) -> ScreenBounds | None:
+        if not all(hasattr(self, name) for name in (
+            "screen_min_x", "screen_min_y", "screen_max_x", "screen_max_y"
+        )):
+            return None
+        return ScreenBounds(self.screen_min_x, self.screen_min_y,
+                            self.screen_max_x, self.screen_max_y)
+
+    def control_event(self, enabled: bool, position: float | None = None) -> dict[str, Any]:
+        event: dict[str, Any] = {
+            "type": "control_mode", "enabled": enabled, "session_id": self.session_id
+        }
+        if enabled and self.auto_switch_edge != "off" and self.screen_bounds() is not None:
+            event.update(edge=self.auto_switch_edge, edge_margin=self.edge_margin)
+            if position is not None:
+                event["position"] = position
+        return event
+
+    def toggle_control_mode(self, position: float | None = None) -> bool:
         with self.state_lock:
-            self.enabled = not self.enabled
+            enabled = not self.enabled
+            if enabled:
+                self.session_id = uuid.uuid4().hex
+            # Never capture local input if the activation cannot be queued.
+            if not self.sender.send(self.control_event(enabled, position)) and enabled:
+                return False
+            self.enabled = enabled
             self.last_mouse_pos = None
-            enabled = self.enabled
+            if not enabled:
+                self.edge_cooldown_until = time.monotonic() + 0.25
 
-        self.sender.send({"type": "control_mode", "enabled": enabled})
         state = "ON" if enabled else "OFF"
         print(f"Control Windows mode: {state}", flush=True)
+        return True
+
+    def handle_remote_event(self, event: dict[str, Any]) -> None:
+        if event.get("type") != "return_control":
+            return
+        with self.state_lock:
+            if (not self.enabled or event["session_id"] != self.session_id
+                    or event["edge"] != self.auto_switch_edge):
+                return
+            bounds = self.screen_bounds()
+            self.enabled = False
+            self.last_mouse_pos = None
+            self.pressed_keys.clear()
+            self.edge_cooldown_until = time.monotonic() + 0.25
+            # Windows already stopped accepting input and released held buttons.
+            # Warp while holding the same lock as the native event callback.
+            if bounds is not None and self.warp_cursor is not None:
+                try:
+                    self.warp_cursor(bounds.landing(
+                        self.auto_switch_edge, event["position"], self.edge_margin
+                    ))
+                except Exception as exc:
+                    print(f"Could not reposition Mac cursor: {exc}", flush=True)
+        print("Returned to Mac from Windows screen edge.", flush=True)
 
     def is_enabled(self) -> bool:
         with self.state_lock:
@@ -423,13 +477,12 @@ class MacControllerClient:
 
     def recover_remote_state_after_reconnect(self) -> None:
         with self.state_lock:
-            enabled = self.enabled
             self.last_mouse_pos = None
-        if not enabled:
-            return
-
-        self.sender.send({"type": "control_mode", "enabled": True})
-        self.release_remote_modifiers()
+            if not self.enabled:
+                return
+            self.session_id = uuid.uuid4().hex
+            self.sender.send(self.control_event(True))
+            self.release_remote_modifiers()
 
     def send_key_event(self, event: dict[str, Any]) -> None:
         mapped_event = self.map_remote_key_event(event)
@@ -487,43 +540,24 @@ class MacControllerClient:
         dy: int = 0,
     ) -> bool:
         with self.state_lock:
-            if self.enabled or self.auto_switch_edge == "off":
+            if (self.enabled or self.auto_switch_edge == "off"
+                    or time.monotonic() < self.edge_cooldown_until):
                 return False
-            min_x = getattr(self, "screen_min_x", None)
-            max_x = getattr(self, "screen_max_x", None)
-            min_y = getattr(self, "screen_min_y", None)
-            max_y = getattr(self, "screen_max_y", None)
-
-        should_activate = (
-            self.auto_switch_edge == "right"
-            and max_x is not None
-            and dx > 0
-            and x >= max_x - self.edge_margin
-        ) or (
-            self.auto_switch_edge == "left"
-            and min_x is not None
-            and dx < 0
-            and x <= min_x + self.edge_margin
-        ) or (
-            self.auto_switch_edge == "top"
-            and y is not None
-            and min_y is not None
-            and dy < 0
-            and y <= min_y + self.edge_margin
-        ) or (
-            self.auto_switch_edge == "bottom"
-            and y is not None
-            and max_y is not None
-            and dy > 0
-            and y >= max_y - self.edge_margin
-        )
-        if not should_activate:
-            return False
-
-        self.toggle_control_mode()
+            bounds = self.screen_bounds()
+            if bounds is None:
+                return False
+            if y is None:
+                y = (bounds.top + bounds.bottom - 1) / 2
+            if not bounds.contains(x, y) or not bounds.crossing(
+                self.auto_switch_edge, x, y, dx, dy, self.edge_margin
+            ):
+                return False
+            position = bounds.fraction(self.auto_switch_edge, x, y)
+            if not self.toggle_control_mode(position):
+                return False
         print(
             f"Activated Windows control from Mac {self.auto_switch_edge} edge. "
-            "Press F8 to return to Mac.",
+            "Move back across the Windows edge or press F8 to return.",
             flush=True,
         )
         return True
@@ -661,6 +695,13 @@ def run_native_macos_event_tap(client: MacControllerClient) -> None:
         screen_min_y + float(main_display_bounds.size.height),
     )
 
+    def warp_cursor(point: tuple[int, int]) -> None:
+        error = Quartz.CGWarpMouseCursorPosition(point)
+        if error:
+            raise RuntimeError(f"CGWarpMouseCursorPosition failed: {error}")
+
+    client.warp_cursor = warp_cursor
+
     event_types = [
         Quartz.kCGEventKeyDown,
         Quartz.kCGEventKeyUp,
@@ -696,7 +737,7 @@ def run_native_macos_event_tap(client: MacControllerClient) -> None:
             if flags & flag_mask
         }
 
-    def callback(_proxy: Any, event_type: int, event: Any, _refcon: Any) -> Any:
+    def process_event(_proxy: Any, event_type: int, event: Any, _refcon: Any) -> Any:
         if event_type == Quartz.kCGEventTapDisabledByTimeout:
             Quartz.CGEventTapEnable(event_tap, True)
             return event
@@ -759,6 +800,11 @@ def run_native_macos_event_tap(client: MacControllerClient) -> None:
             return None if should_suppress else event
 
         return event
+
+    def callback(proxy: Any, event_type: int, event: Any, refcon: Any) -> Any:
+        # Serialize local input with return notifications from the socket reader.
+        with client.state_lock:
+            return process_event(proxy, event_type, event, refcon)
 
     tap_locations = (
         ("HID", Quartz.kCGHIDEventTap),
@@ -1002,7 +1048,7 @@ def main() -> None:
     if args.auto_switch_edge != "off":
         print(
             f"Mac {args.auto_switch_edge} edge activates Windows control; "
-            "F8 returns to Mac.",
+            "the opposite Windows edge or F8 returns to Mac.",
             flush=True,
         )
 
@@ -1025,7 +1071,13 @@ def main() -> None:
         args.clipboard_max_bytes,
     )
     sender.set_reconnect_callback(client.recover_remote_state_after_reconnect)
-    sender.set_incoming_handler(clipboard_sync.handle_remote_event)
+    def handle_incoming_event(event: dict[str, Any]) -> None:
+        if event.get("type") == "return_control":
+            client.handle_remote_event(event)
+        else:
+            clipboard_sync.handle_remote_event(event)
+
+    sender.set_incoming_handler(handle_incoming_event)
     clipboard_sync.start()
     if args.suppress_local_mouse and sys.platform == "darwin":
         try:

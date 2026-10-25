@@ -18,6 +18,7 @@ EVENT_TYPES = {
     "clipboard_text",
     "control_mode",
     "heartbeat",
+    "return_control",
     "key_down",
     "key_up",
     "mouse_click",
@@ -63,6 +64,30 @@ def validate_event(event: dict[str, Any]) -> None:
 
     if event_type == "control_mode":
         _require_bool(event, "enabled")
+        if "session_id" in event:
+            _require_string(event, "session_id", max_length=64)
+        if "edge" in event:
+            _require_string(event, "session_id", max_length=64)
+            _require_string(event, "edge", max_length=16)
+            if event["edge"] not in {"left", "right", "top", "bottom"}:
+                raise ValueError("invalid edge")
+            margin = event.get("edge_margin")
+            if type(margin) is not int or not 1 <= margin <= 100:
+                raise ValueError("edge_margin must be an integer between 1 and 100")
+        if "position" in event:
+            if "edge" not in event:
+                raise ValueError("position requires edge")
+            _require_number(event, "position")
+            if not 0 <= event["position"] <= 1:
+                raise ValueError("position must be between 0 and 1")
+    elif event_type == "return_control":
+        _require_string(event, "session_id", max_length=64)
+        _require_string(event, "edge", max_length=16)
+        if event.get("edge") not in {"left", "right", "top", "bottom"}:
+            raise ValueError("invalid edge")
+        _require_number(event, "position")
+        if not 0 <= event["position"] <= 1:
+            raise ValueError("position must be between 0 and 1")
     elif event_type in {"mouse_move", "mouse_scroll"}:
         _require_number(event, "dx")
         _require_number(event, "dy")

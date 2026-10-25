@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import socket
+import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from pynput import keyboard, mouse
 
@@ -12,6 +14,7 @@ from auth import AuthenticationError, authenticate_server, generate_pairing_code
 from clipboard_sync import ClipboardSync
 from discovery import broadcast_receiver
 from protocol import MAX_EVENT_LINE_BYTES, decode_event, encode_event
+from screen_edges import OPPOSITE_EDGE, ScreenBounds
 from settings import load_settings, save_settings
 from version import __version__
 
@@ -23,6 +26,10 @@ DEFAULT_CLIPBOARD_POLL_INTERVAL = 0.7
 DEFAULT_CLIPBOARD_MAX_BYTES = 262144
 DEFAULT_HEARTBEAT_TIMEOUT = 8.0
 
+
+# Keep primary-screen metrics and cursor coordinates in the same pixel space.
+if sys.platform == "win32":
+    ctypes.windll.user32.SetProcessDPIAware()
 
 mouse_controller = mouse.Controller()
 keyboard_controller = keyboard.Controller()
@@ -213,6 +220,75 @@ def handle_event(event: dict[str, Any]) -> None:
             print(f"Skipped unsupported key: {event}", flush=True)
 
 
+def primary_screen_bounds() -> ScreenBounds:
+    if sys.platform != "win32":
+        raise OSError("Screen-edge return requires Windows")
+    user32 = ctypes.windll.user32
+    width, height = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    if width <= 1 or height <= 1:
+        raise OSError("Cannot read Windows primary display dimensions")
+    return ScreenBounds(0, 0, width, height)
+
+
+class EdgeReturnController:
+    """Per-connection layout and return state; all input runs on the reader thread."""
+
+    def __init__(self, send: Callable[[dict[str, Any]], bool],
+                 get_bounds: Callable[[], ScreenBounds] | None = None) -> None:
+        self.send = send
+        self.get_bounds = get_bounds or primary_screen_bounds
+        self.mac_edge: str | None = None
+        self.bounds: ScreenBounds | None = None
+        self.session_id = ""
+        self.margin = 2
+
+    def handle(self, event: dict[str, Any]) -> bool:
+        global control_mode_enabled
+
+        if event["type"] == "control_mode":
+            self.mac_edge = None
+            self.bounds = None
+            handle_event(event)
+            if event["enabled"] and "edge" in event:
+                try:
+                    bounds = self.get_bounds()
+                    if "position" in event:
+                        mouse_controller.position = bounds.landing(
+                            OPPOSITE_EDGE[event["edge"]], event["position"], event["edge_margin"]
+                        )
+                except OSError as exc:
+                    print(f"Edge return unavailable; use F8: {exc}", flush=True)
+                else:
+                    self.bounds = bounds
+                    self.mac_edge = event["edge"]
+                    self.session_id = event["session_id"]
+                    self.margin = event["edge_margin"]
+            return True
+
+        if (event["type"] != "mouse_move" or not control_mode_enabled
+                or self.bounds is None or self.mac_edge is None):
+            handle_event(event)
+            return True
+
+        before_x, before_y = mouse_controller.position
+        handle_event(event)
+        x, y = mouse_controller.position
+        edge = OPPOSITE_EDGE[self.mac_edge]
+        if (self.bounds.contains(before_x, before_y) and self.bounds.crossing(
+                edge, x, y, event["dx"], event["dy"], self.margin)):
+            # Stop consuming queued input BEFORE notifying Mac. A fresh enable
+            # message is required to begin another control session.
+            control_mode_enabled = False
+            release_all_remote_inputs()
+            return_event = {
+                "type": "return_control", "session_id": self.session_id,
+                "edge": self.mac_edge, "position": self.bounds.fraction(edge, x, y),
+            }
+            self.mac_edge = None
+            return self.send(return_event)
+        return True
+
+
 def handle_client(
     conn: socket.socket,
     address: tuple[str, int],
@@ -241,17 +317,18 @@ def handle_client(
     conn.settimeout(heartbeat_timeout)
     send_lock = threading.Lock()
 
-    def send_clipboard_event(event: dict[str, Any]) -> bool:
+    def send_server_event(event: dict[str, Any]) -> bool:
         try:
             with send_lock:
                 conn.sendall(encode_event(event))
             return True
         except OSError as exc:
-            print(f"Clipboard send failed: {exc}", flush=True)
+            print(f"Send to Mac failed: {exc}", flush=True)
             return False
 
+    edge_return = EdgeReturnController(send_server_event)
     clipboard_sync = ClipboardSync(
-        send_clipboard_event,
+        send_server_event,
         lambda: control_mode_enabled,
         "windows",
         "Mac",
@@ -272,7 +349,8 @@ def handle_client(
                     if event.get("type") == "clipboard_text":
                         clipboard_sync.handle_remote_event(event)
                     else:
-                        handle_event(event)
+                        if not edge_return.handle(event):
+                            break
                 except Exception as exc:
                     print(f"Bad event: {exc}", flush=True)
         except (OSError, TimeoutError) as exc:

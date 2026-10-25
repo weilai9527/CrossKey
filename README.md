@@ -21,6 +21,7 @@ config.example.json  不含私密信息的配置示例
 config.json      两端本地配置（自动创建，不提交到 Git）
 configure_ip.py  手动修改 Windows IP/端口
 configure_layout.py  在终端设置 Windows 相对 Mac 的屏幕位置
+screen_edges.py  双向穿屏的边缘检测与落点比例映射
 check_connection.py  网络和配对诊断
 requirements.txt Python 依赖
 ```
@@ -155,7 +156,7 @@ python3 mac_client.py --no-discover
 4. Mac 触控板移动、左右点击、键盘输入会发送到 Windows
 5. 再按一次 `F8`，退出控制模式
 
-### 从屏幕边缘进入 Windows
+### 双向鼠标穿屏
 
 像设置扩展显示器一样在终端选择 Windows 位于 Mac 的哪一侧：
 
@@ -190,12 +191,31 @@ python3 configure_layout.py --position off
 "edge_margin": 2
 ```
 
-重新启动 Mac 客户端后，把鼠标向 Mac 主显示器右边缘继续推动，就会自动进入 Windows
-控制模式。当前版本使用 `F8` 返回 Mac；`auto_switch_edge` 也支持 `left`、`top` 和
-`bottom`，或设为 `off` 关闭。该功能需要 macOS 原生输入拦截，因此
-`suppress_local_mouse` 必须保持为 `true`。
+两端都更新到 v0.4.0 或更新版本并重启后，把鼠标向 Mac 主显示器右边缘继续推动，
+就会自动进入 Windows，鼠标落在 Windows 主显示器左侧。控制 Windows 时，
+把鼠标移到其左边缘并继续向左推动，就会自动返回 Mac。
 
-目前边缘切换按 Mac 主显示器计算，多显示器布局将在后续版本完善。
+只需在 Mac 设置布局；进入控制模式时会把布局发送给 Windows，无需两端分别配置。
+四个方向的对应关系如下：
+
+| Windows 相对 Mac 的位置 | 从 Mac 进入 | 从 Windows 返回 |
+| --- | --- | --- |
+| `right`（右侧） | Mac 右边缘 | Windows 左边缘 |
+| `left`（左侧） | Mac 左边缘 | Windows 右边缘 |
+| `top`（上方） | Mac 上边缘 | Windows 下边缘 |
+| `bottom`（下方） | Mac 下边缘 | Windows 上边缘 |
+
+两端按边缘上的相对位置映射鼠标落点，适配不同分辨率。落点稍微退入屏幕内部，
+返回 Mac 后有 0.25 秒防抖，避免立即来回切换。返回前 Windows 会释放所有远程
+按键和鼠标按钮；跨设备拖动不会延续为 Mac 上的拖动操作。
+
+`F8` 始终可以手动切换。布局开启时，使用 `F8` 进入 Windows 也能从对应边缘返回，
+但不会改变进入时 Windows 鼠标的位置。设为 `off` 关闭双向边缘切换（默认关闭）。
+该功能需要 macOS 原生输入拦截，因此 `suppress_local_mouse` 必须保持为 `true`。
+旧版 Windows 接收端仍可用 F8 返回，但不支持自动返回。
+
+目前两端均按主显示器计算，不支持多显示器布局映射。更改屏幕分辨率或主显示器后，
+请重启两端程序。穿屏使用 Mac 的鼠标/触控板；Windows 本机鼠标不会反向控制 Mac。
 
 连接异常时，可以在 Mac 上检查网络和配对认证：
 
@@ -371,7 +391,6 @@ Python
 这个 Demo 主要用于证明可行性，暂时不处理：
 
 ```text
-从 Windows 边缘自动返回 Mac 的完整双向鼠标穿屏
 多显示器坐标映射
 中文输入法完整同步
 图片/文件/富文本剪贴板同步
@@ -396,7 +415,9 @@ Python
 python3 -m unittest discover -v
 ```
 
-测试覆盖协议边界、版本兼容、配对握手、共享配置和发现消息解析。
+测试覆盖协议边界、版本兼容、配对握手、共享配置、发现消息解析、四方向双向穿屏、
+不同分辨率落点、返回防抖、过期通知、重连与按键释放，并包含已认证 socket 的往返集成测试。
+测试中的鼠标/键盘控制器使用替身；真实 macOS 权限、Windows 显示缩放与跨机器手感仍需真机验收。
 
 ## 打包
 

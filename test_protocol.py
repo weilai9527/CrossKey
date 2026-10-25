@@ -23,6 +23,35 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertEqual(event["type"], "heartbeat")
 
+    def test_edge_handoff_round_trip(self) -> None:
+        for event in (
+            {"type": "control_mode", "enabled": True, "edge": "left",
+             "edge_margin": 2, "position": 0.25, "session_id": "session-1"},
+            {"type": "return_control", "edge": "left",
+             "position": 0.75, "session_id": "session-1"},
+        ):
+            with self.subTest(event=event):
+                self.assertEqual(decode_event(encode_event(event)),
+                                 dict(event, protocol_version=PROTOCOL_VERSION))
+
+    def test_invalid_return_payloads_are_rejected(self) -> None:
+        base = {"type": "return_control", "edge": "right",
+                "position": 0.5, "session_id": "session-1"}
+        for key, value in (("edge", "off"), ("edge", []), ("session_id", ""),
+                           ("position", -0.1), ("position", 1.1),
+                           ("position", True), ("position", float("nan"))):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                encode_event(dict(base, **{key: value}))
+
+    def test_invalid_layout_payloads_are_rejected(self) -> None:
+        base = {"type": "control_mode", "enabled": True, "edge": "right",
+                "edge_margin": 2, "position": 0.5, "session_id": "session-1"}
+        for key, value in (("edge", "off"), ("edge_margin", 0), ("edge_margin", 101),
+                           ("edge_margin", True), ("edge_margin", 2.5),
+                           ("session_id", ""), ("position", 2)):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                encode_event(dict(base, **{key: value}))
+
     def test_legacy_event_without_version_is_accepted(self) -> None:
         line = b'{"type":"control_mode","enabled":true}\n'
 
