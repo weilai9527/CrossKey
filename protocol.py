@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import base64
+import re
 from typing import Any
 
 from screen_edges import validate_edge_monitors
@@ -12,12 +14,17 @@ from screen_edges import validate_edge_monitors
 ENCODING = "utf-8"
 PROTOCOL_VERSION = 1
 MAX_EVENT_LINE_BYTES = 2 * 1024 * 1024
+CLIPBOARD_CHUNK_BYTES = 64 * 1024
+CLIPBOARD_LIMITS = {"image": 16 * 1024 * 1024, "rich": 16 * 1024 * 1024,
+                    "files": 100 * 1024 * 1024}
 
 EVENT_TYPES = {
     "auth_challenge",
     "auth_response",
     "auth_ok",
     "clipboard_text",
+    "clipboard_chunk",
+    "clipboard_ack",
     "control_mode",
     "heartbeat",
     "return_control",
@@ -65,6 +72,13 @@ def validate_event(event: dict[str, Any]) -> None:
     if event_type not in EVENT_TYPES:
         raise ValueError(f"unsupported event type: {event_type!r}")
 
+    if event_type in {"auth_ok", "auth_response"} and "capabilities" in event:
+        capabilities = event["capabilities"]
+        if (not isinstance(capabilities, list) or len(capabilities) > 32
+                or any(not isinstance(item, str) or not 1 <= len(item) <= 64
+                       for item in capabilities)):
+            raise ValueError("invalid capabilities")
+
     if event_type == "control_mode":
         _require_bool(event, "enabled")
         if "session_id" in event:
@@ -90,12 +104,6 @@ def validate_event(event: dict[str, Any]) -> None:
     elif event_type == "control_rejected":
         _require_string(event, "session_id", max_length=64)
         _require_string(event, "reason", max_length=256)
-    elif event_type == "auth_ok" and "capabilities" in event:
-        capabilities = event["capabilities"]
-        if (not isinstance(capabilities, list) or len(capabilities) > 32
-                or any(not isinstance(item, str) or not 1 <= len(item) <= 64
-                       for item in capabilities)):
-            raise ValueError("invalid capabilities")
     elif event_type == "return_control":
         _require_string(event, "session_id", max_length=64)
         _require_string(event, "edge", max_length=16)
@@ -122,6 +130,25 @@ def validate_event(event: dict[str, Any]) -> None:
         for field in ("clipboard_id", "source"):
             if field in event:
                 _require_string(event, field, max_length=256)
+    elif event_type == "clipboard_ack":
+        _require_string(event, "clipboard_id", max_length=64)
+        _require_bool(event, "accepted")
+    elif event_type == "clipboard_chunk":
+        _require_string(event, "clipboard_id", max_length=64)
+        _require_string(event, "source", max_length=32)
+        _require_string(event, "kind", max_length=16)
+        kind, size, index = event["kind"], event.get("size"), event.get("index")
+        if kind not in CLIPBOARD_LIMITS or type(size) is not int or not 0 < size <= CLIPBOARD_LIMITS[kind]:
+            raise ValueError("invalid clipboard payload size or kind")
+        if type(index) is not int or not 0 <= index < (size + CLIPBOARD_CHUNK_BYTES - 1) // CLIPBOARD_CHUNK_BYTES:
+            raise ValueError("invalid clipboard chunk index")
+        _require_string(event, "sha256", max_length=64)
+        if not re.fullmatch(r"[0-9a-f]{64}", event["sha256"]):
+            raise ValueError("invalid clipboard checksum")
+        _require_string(event, "data", max_length=4 * ((CLIPBOARD_CHUNK_BYTES + 2) // 3))
+        chunk = base64.b64decode(event["data"], validate=True)
+        if len(chunk) != min(CLIPBOARD_CHUNK_BYTES, size - index * CLIPBOARD_CHUNK_BYTES):
+            raise ValueError("invalid clipboard chunk length")
     elif event_type == "auth_challenge":
         _require_string(event, "nonce", max_length=128)
     elif event_type == "auth_response":

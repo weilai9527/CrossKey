@@ -349,7 +349,8 @@ def handle_client(
     control_mode_enabled = False
     print(f"Mac connected from {address[0]}:{address[1]}", flush=True)
     try:
-        authenticate_server(conn, pairing_code, capabilities=("monitor_mapping_v1",))
+        peer = authenticate_server(conn, pairing_code,
+                                   capabilities=("monitor_mapping_v1", "clipboard_v2"))
     except (AuthenticationError, OSError, ValueError) as exc:
         print(f"Authentication failed for {address[0]}: {exc}", flush=True)
         conn.close()
@@ -380,6 +381,7 @@ def handle_client(
         clipboard_only_control_mode,
         clipboard_poll_interval,
         clipboard_max_bytes,
+        supports_extended=lambda: "clipboard_v2" in peer.get("capabilities", []),
     )
     clipboard_sync.start()
     with conn, conn.makefile("rb") as reader:
@@ -390,7 +392,7 @@ def handle_client(
                     break
                 try:
                     event = decode_event(line)
-                    if event.get("type") == "clipboard_text":
+                    if event.get("type") in {"clipboard_text", "clipboard_chunk", "clipboard_ack"}:
                         clipboard_sync.handle_remote_event(event)
                     else:
                         if not edge_return.handle(event):
@@ -476,7 +478,7 @@ def parse_args() -> argparse.Namespace:
         "--sync-clipboard",
         action=argparse.BooleanOptionalAction,
         default=bool(config.get("sync_clipboard", True)),
-        help="Synchronize plain text clipboard contents with Mac.",
+        help="Synchronize text, images, files and rich text with Mac.",
     )
     parser.add_argument(
         "--clipboard-only-control-mode",

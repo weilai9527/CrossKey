@@ -145,6 +145,8 @@ class EventSender:
         self.reconnect_delay = reconnect_delay
         self.heartbeat_interval = heartbeat_interval
         self.send_queue: queue.Queue[bytes] = queue.Queue(maxsize=send_queue_size)
+        self.clipboard_queue: queue.Queue[bytes] = queue.Queue(maxsize=8)
+        self.send_wakeup = threading.Event()
         self.host = ""
         self.port = DEFAULT_PORT
         self.sock: socket.socket | None = None
@@ -171,7 +173,7 @@ class EventSender:
         host, port = target
         sock = socket.create_connection((host, port), timeout=10)
         try:
-            result = authenticate_client(sock, self.pairing_code)
+            result = authenticate_client(sock, self.pairing_code, capabilities=("clipboard_v2",))
         except Exception:
             sock.close()
             raise
@@ -196,12 +198,14 @@ class EventSender:
             self._start_reconnect()
             return False
 
+        target_queue = self.clipboard_queue if event.get("type") == "clipboard_chunk" else self.send_queue
         try:
-            self.send_queue.put_nowait(data)
+            target_queue.put_nowait(data)
         except queue.Full:
-            if event.get("type") != "mouse_move":
+            if event.get("type") not in {"mouse_move", "clipboard_chunk"}:
                 print("Send queue is full. Dropping event.", flush=True)
             return False
+        self.send_wakeup.set()
         return True
 
     def close(self) -> None:
@@ -228,11 +232,12 @@ class EventSender:
             self.sock = None
 
     def _clear_send_queue(self) -> None:
-        while True:
-            try:
-                self.send_queue.get_nowait()
-            except queue.Empty:
-                return
+        for pending in (self.send_queue, self.clipboard_queue):
+            while True:
+                try:
+                    pending.get_nowait()
+                except queue.Empty:
+                    break
 
     def _start_reconnect(self) -> None:
         if self.stop_event.is_set():
@@ -309,10 +314,15 @@ class EventSender:
 
     def _writer_loop(self) -> None:
         while not self.stop_event.is_set():
+            self.send_wakeup.clear()
             try:
-                data = self.send_queue.get(timeout=0.2)
+                data = self.send_queue.get_nowait()
             except queue.Empty:
-                continue
+                try:
+                    data = self.clipboard_queue.get_nowait()
+                except queue.Empty:
+                    self.send_wakeup.wait(0.2)
+                    continue
 
             with self.lock:
                 sock = self.sock
@@ -997,7 +1007,7 @@ def parse_args() -> argparse.Namespace:
         "--sync-clipboard",
         action=argparse.BooleanOptionalAction,
         default=bool(config.get("sync_clipboard", True)),
-        help="Synchronize plain text clipboard contents with Windows.",
+        help="Synchronize text, images, files and rich text with Windows.",
     )
     parser.add_argument(
         "--clipboard-only-control-mode",
@@ -1121,8 +1131,13 @@ def main() -> None:
         args.clipboard_only_control_mode,
         args.clipboard_poll_interval,
         args.clipboard_max_bytes,
+        supports_extended=lambda: "clipboard_v2" in sender.capabilities,
     )
-    sender.set_reconnect_callback(client.recover_remote_state_after_reconnect)
+    def recover_after_reconnect() -> None:
+        clipboard_sync.reset_connection()
+        client.recover_remote_state_after_reconnect()
+
+    sender.set_reconnect_callback(recover_after_reconnect)
     def handle_incoming_event(event: dict[str, Any]) -> None:
         if event.get("type") in {"return_control", "control_rejected"}:
             client.handle_remote_event(event)

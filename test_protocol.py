@@ -1,5 +1,6 @@
 import json
 import unittest
+from test_clipboard_sync import chunks
 
 from protocol import (
     MAX_EVENT_LINE_BYTES,
@@ -10,6 +11,24 @@ from protocol import (
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_clipboard_chunks_and_ack_round_trip(self) -> None:
+        for kind in ("image", "files", "rich"):
+            event = chunks(kind, b"binary\x00data")[0]
+            self.assertEqual(decode_event(encode_event(event)), dict(event, protocol_version=1))
+        ack = {"type": "clipboard_ack", "clipboard_id": "id", "accepted": True}
+        self.assertEqual(decode_event(encode_event(ack)), dict(ack, protocol_version=1))
+
+    def test_invalid_clipboard_chunks_are_rejected(self) -> None:
+        event = chunks("image", b"png")[0]
+        for key, value in (("kind", "executable"), ("size", 0), ("size", True),
+                           ("size", 16 * 1024 * 1024 + 1), ("index", -1),
+                           ("index", 1), ("index", True), ("sha256", "bad"),
+                           ("data", "@@@="), ("data", "YQ==")):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                encode_event(dict(event, **{key: value}))
+        with self.assertRaises(ValueError):
+            encode_event({"type": "clipboard_ack", "clipboard_id": "id", "accepted": 1})
+
     def test_multi_monitor_events_and_rejections_round_trip(self) -> None:
         events = (
             {"type": "control_mode", "enabled": True, "edge": "top", "edge_margin": 2,

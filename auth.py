@@ -44,7 +44,8 @@ def _read_event(sock: socket.socket) -> dict[str, object]:
         raise AuthenticationError(f"invalid authentication message: {exc}") from exc
 
 
-def authenticate_client(sock: socket.socket, pairing_code: str) -> dict[str, object]:
+def authenticate_client(sock: socket.socket, pairing_code: str,
+                        capabilities: tuple[str, ...] = ()) -> dict[str, object]:
     pairing_code = validate_pairing_code(pairing_code)
     previous_timeout = sock.gettimeout()
     sock.settimeout(10)
@@ -53,7 +54,8 @@ def authenticate_client(sock: socket.socket, pairing_code: str) -> dict[str, obj
         if challenge.get("type") != "auth_challenge":
             raise AuthenticationError("receiver did not start authentication")
         nonce = str(challenge["nonce"])
-        sock.sendall(encode_event({"type": "auth_response", "digest": _digest(pairing_code, nonce)}))
+        sock.sendall(encode_event({"type": "auth_response", "digest": _digest(pairing_code, nonce),
+                                  "capabilities": list(capabilities)}))
         result = _read_event(sock)
         if result.get("type") != "auth_ok":
             raise AuthenticationError("pairing code was rejected")
@@ -63,7 +65,7 @@ def authenticate_client(sock: socket.socket, pairing_code: str) -> dict[str, obj
 
 
 def authenticate_server(conn: socket.socket, pairing_code: str,
-                        capabilities: tuple[str, ...] = ()) -> None:
+                        capabilities: tuple[str, ...] = ()) -> dict[str, object]:
     pairing_code = validate_pairing_code(pairing_code)
     nonce = secrets.token_hex(32)
     previous_timeout = conn.gettimeout()
@@ -76,5 +78,6 @@ def authenticate_server(conn: socket.socket, pairing_code: str,
         ):
             raise AuthenticationError("pairing code was rejected")
         conn.sendall(encode_event({"type": "auth_ok", "capabilities": list(capabilities)}))
+        return response
     finally:
         conn.settimeout(previous_timeout)

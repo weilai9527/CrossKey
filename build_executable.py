@@ -33,7 +33,7 @@ def build(target: str) -> None:
         "pynput",
     ]
     if target == "mac":
-        command.extend(["--hidden-import", "Quartz"])
+        command.extend(["--hidden-import", "Quartz", "--hidden-import", "AppKit"])
     command.append(str(ROOT / entry))
     subprocess.run(command, cwd=ROOT, check=True)
 

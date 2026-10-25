@@ -9,17 +9,18 @@ class AuthenticationTests(unittest.TestCase):
     def test_matching_pairing_codes_authenticate(self) -> None:
         server, client = socket.socketpair()
         errors: list[Exception] = []
+        peers = []
 
         def run_server() -> None:
             try:
-                authenticate_server(server, "123456", capabilities=("monitor_mapping_v1",))
+                peers.append(authenticate_server(server, "123456", capabilities=("monitor_mapping_v1",)))
             except Exception as exc:
                 errors.append(exc)
 
         thread = threading.Thread(target=run_server)
         thread.start()
         try:
-            result = authenticate_client(client, "123456")
+            result = authenticate_client(client, "123456", capabilities=("clipboard_v2",))
             self.assertEqual(result["capabilities"], ["monitor_mapping_v1"])
         finally:
             client.close()
@@ -28,6 +29,7 @@ class AuthenticationTests(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
+        self.assertEqual(peers[0]["capabilities"], ["clipboard_v2"])
 
     def test_wrong_pairing_code_is_rejected(self) -> None:
         server, client = socket.socketpair()

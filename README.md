@@ -23,6 +23,9 @@ configure_ip.py  手动修改 Windows IP/端口
 configure_layout.py  在终端设置 Windows 相对 Mac 的屏幕位置
 screen_edges.py  双向穿屏的边缘检测与落点比例映射
 windows_monitors.py  Windows 显示设备编号、坐标与 DPI 处理
+clipboard_sync.py    双向剪贴板同步、分块传输和接收确认
+native_clipboard.py  macOS / Windows 原生剪贴板读写
+clipboard_formats.py 图片、文件归档和富文本格式转换
 check_connection.py  网络和配对诊断
 requirements.txt Python 依赖
 ```
@@ -334,9 +337,25 @@ Command + C / Command + V
 
 ## 剪贴板同步
 
-当前版本只同步纯文本剪贴板，不同步图片、文件、富文本。
+从 v0.6.0 起，支持 Mac ↔ Windows 双向同步纯文本、图片、文件/文件夹和富文本。
+**两台电脑都需要更新项目文件、重新安装 `requirements.txt` 中的依赖并重启程序**；
+使用打包程序时，需要分别重新打包 Mac 和 Windows 版本。
+新旧版本混用时仅同步文本，富文本退回纯文本，不发送图片或文件。
 
-默认只有控制模式开启时才同步：Mac 复制文本后，Windows 可以粘贴同样内容；Windows 复制文本后，Mac 可以粘贴同样内容。
+默认只有控制模式开启时才同步。复制后等待接收端显示 `Clipboard ... received`，
+再在目标应用里粘贴；大文件需要等待传输完成。
+
+- **图片**：复制截图或应用中的图片，在另一端的聊天窗口、文档或图片编辑器粘贴。
+  Mac 可用 `Control + Shift + Command + 4` 将截图放到剪贴板；Windows 可用截图工具复制。
+  图片统一通过 PNG 传输，Mac 同时提供 TIFF，Windows 同时提供 DIB 位图兼容格式。
+  PNG 保留透明度；只接受传统 DIB 的应用会使用白色背景。
+- **文件/文件夹**：在 Finder 或资源管理器复制实际存在的文件或文件夹，
+  然后在另一端的 Finder／资源管理器目标目录粘贴，也可以粘贴到支持文件附件的应用。
+  复制一张图片文件会按文件传输；要粘贴图片内容，请在图片查看器中复制图片。
+  支持多选和嵌套目录，始终按复制处理，不删除或移动源文件。
+- **富文本**：同步 HTML、RTF 以及应用提供的纯文本备用内容。
+  在支持相应格式的应用中可保留粗体、颜色、链接、表格等样式，纯文本编辑器仅粘贴文字。
+  实际样式由目标应用决定；不保证 Office 私有格式、RTFD 附件、外链图片或嵌入对象完整迁移。
 
 可以在 `config.json` 里关闭：
 
@@ -350,7 +369,26 @@ Command + C / Command + V
 "clipboard_only_control_mode": false
 ```
 
-默认最大同步 256KB 文本，超过会跳过，不会打印剪贴板内容。
+文本默认最多 256 KiB，可通过 `clipboard_max_bytes` 调整。
+图片 PNG 最多 16 MiB、3200 万像素；富文本传输包最多 16 MiB；
+文件归档和解包后的文件总量各最多 100 MiB，最多 2000 个文件/目录条目。
+超过限制会跳过并显示原因，不会打印剪贴板内容。
+
+接收文件先保存到系统临时目录下独立的 `crosskey-clipboard-*` 目录，校验完整后
+才更新剪贴板。程序退出后暂存文件仍保留，方便继续粘贴；不再需要后可以手动删除这些目录。
+文件内容和目录结构会复制，权限、扩展属性和资源分支不作跨系统保留。
+暂不支持符号链接、特殊文件、尚未落盘的虚拟附件，以及 Windows 不接受的文件名
+（例如 `:`、`?` 或保留设备名）；这些情况会明确跳过整个文件批次。
+
+传输按 64 KiB 分块并进行 SHA-256 校验，收到完整数据后才写入剪贴板。
+键鼠事件优先于 Mac 的文件发送队列；中断连接后重新传输当前剪贴板内容。
+如果传输期间接收端又复制了新内容，会保留接收端的新内容；需要重新传输时请再次复制源内容。
+
+测试：`python3 -m unittest discover -v`（Windows 使用 `python`）。
+Mac 原生格式集成测试使用独立的私有测试剪贴板，不修改日常剪贴板：
+`CROSSKEY_NATIVE_TEST=1 python3 -m unittest test_native_clipboard.MacNativeClipboardTests -v`。
+Windows 的格式构造和资源释放有模拟测试，发布前仍应在 Windows 真机上分别验证
+截图粘贴、资源管理器多文件/文件夹粘贴，以及浏览器或 Word 的富文本粘贴。
 
 默认配置会在控制模式打开时拦截 Mac 本机鼠标和键盘，避免控制 Windows 时 Mac 屏幕跟着乱点：
 
@@ -457,7 +495,7 @@ Python
 ```text
 Mac 多显示器入口、每个边缘的局部连接区域和物理尺寸校准
 中文输入法完整同步
-图片/文件/富文本剪贴板同步
+剪贴板中的虚拟文件、符号链接、Office 私有对象格式
 托盘图标
 ```
 
