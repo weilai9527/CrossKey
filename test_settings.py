@@ -2,12 +2,30 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from discovery import parse_announcement
-from settings import load_settings, save_settings
+from settings import default_config_path, load_settings, save_settings
 
 
 class SettingsTests(unittest.TestCase):
+    def test_failed_atomic_replace_keeps_previous_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            save_settings({"port": 5050}, path)
+            before = path.read_bytes()
+            with patch("settings.os.replace", side_effect=OSError("disk error")):
+                with self.assertRaises(OSError):
+                    save_settings({"port": 6060}, path)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(path.parent.glob(".crosskey-*.tmp")), [])
+
+    def test_frozen_configuration_uses_persistent_user_directory(self) -> None:
+        with patch("settings.sys.frozen", True, create=True), patch("settings.sys.platform", "win32"), patch.dict("os.environ", {"APPDATA": "/user-config"}):
+            self.assertEqual(default_config_path(), Path("/user-config/CrossKey/config.json"))
+        with patch("settings.sys.frozen", True, create=True), patch("settings.sys.platform", "darwin"), patch("settings.Path.home", return_value=Path("/user-home")):
+            self.assertEqual(default_config_path(), Path("/user-home/Library/Application Support/CrossKey/config.json"))
+
     def test_defaults_are_merged_with_saved_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

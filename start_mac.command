@@ -1,29 +1,33 @@
 #!/bin/zsh
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
-echo "Mac -> Windows control demo"
-echo
-echo "Mac will try UDP auto discovery first, then fall back to config.json."
-echo "Make sure Windows is already running: python win_server.py"
-echo "If macOS says permissions are missing, enable Accessibility and Input Monitoring for Terminal."
-echo
-read -r "?Update fallback Windows IP/port and pairing code before connecting? [y/N] " update_config
-case "$update_config" in
-  y|Y|yes|YES)
-    python3 configure_ip.py || exit 1
-    echo
-    ;;
-esac
+if [[ -x .venv/bin/python3 ]]; then
+  crosskey_python="$PWD/.venv/bin/python3"
+elif [[ -x venv/bin/python3 ]]; then
+  crosskey_python="$PWD/venv/bin/python3"
+elif command -v python3 >/dev/null 2>&1; then
+  crosskey_python="$(command -v python3)"
+else
+  echo "CrossKey needs Python 3.10 or newer with Tcl/Tk."
+  echo "Install Python from python.org, then run: python3 -m pip install -r requirements.txt"
+  read -r "?Press Enter to close..."
+  exit 1
+fi
 
-echo "Press F8 to control Windows. Press F8 again to stop."
-echo "If F8 does not work, use Control + Option + Command + 8."
-echo "Mac local mouse/keyboard is suppressed only while control mode is ON."
-echo "Press Ctrl+C in this window to quit."
-echo
+if ! "$crosskey_python" -c 'import sys, tkinter; assert sys.version_info >= (3, 10), "Python 3.10+ is required"'; then
+  echo "This Python needs Python 3.10+ and Tcl/Tk support to open the CrossKey window."
+  echo "You can still use the command-line client: python3 mac_client.py"
+  read -r "?Press Enter to close..."
+  exit 1
+fi
 
-python3 mac_client.py
-
-echo
-echo "Program exited. You can close this window."
-read -r "?Press Enter to close..."
+echo "Opening CrossKey. Connection and screen layout are configured in the small window."
+"$crosskey_python" "$PWD/launcher.py"
+crosskey_exit=$?
+if (( crosskey_exit != 0 )); then
+  echo "CrossKey could not start. Review the error above."
+  echo "If a dependency is missing, run: python3 -m pip install -r requirements.txt"
+  read -r "?Press Enter to close..."
+fi
+exit "$crosskey_exit"

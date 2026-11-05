@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import math
 import os
 import subprocess
 import queue
+import select
 import socket
 import sys
 import threading
@@ -132,6 +134,16 @@ MAC_KEYCODE_CHARS = {
 
 ConnectionTargetResolver = Callable[[], tuple[str, int] | None]
 IncomingEventHandler = Callable[[dict[str, Any]], None]
+StatusCallback = Callable[[dict[str, Any]], None]
+
+
+def report_status(callback: StatusCallback | None, state: str, message: str, **details: Any) -> None:
+    """Callbacks may run on an input/network worker; GUI callers must enqueue them."""
+    if callback is not None:
+        try:
+            callback({"state": state, "message": message, **details})
+        except Exception as exc:
+            print(f"Status callback failed: {exc}", flush=True)
 
 
 class EventSender:
@@ -143,12 +155,14 @@ class EventSender:
         pairing_code: str = "",
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         response_timeout: float = 30.0,
+        on_status: StatusCallback | None = None,
     ) -> None:
         self.resolve_target = resolve_target
         self.pairing_code = pairing_code
         self.reconnect_delay = reconnect_delay
         self.heartbeat_interval = heartbeat_interval
         self.response_timeout = response_timeout
+        self.on_status = on_status
         self.last_heartbeat_ack = time.monotonic()
         self.pending_heartbeats: set[str] = set()
         self.send_started_at: float | None = None
@@ -158,10 +172,12 @@ class EventSender:
         self.host = ""
         self.port = DEFAULT_PORT
         self.sock: socket.socket | None = None
+        self._connecting_sock: socket.socket | None = None
         self.capabilities: set[str] = set()
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.reconnect_thread: threading.Thread | None = None
+        self.reader_threads: list[threading.Thread] = []
         self.writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
         self.heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
@@ -174,32 +190,82 @@ class EventSender:
         self.heartbeat_thread.start()
 
     def connect(self, target: tuple[str, int] | None = None) -> None:
+        if self.stop_event.is_set():
+            raise OSError("Connection attempt cancelled")
         if target is None:
             target = self.resolve_target()
         if target is None:
             raise OSError("No Windows receiver target is available.")
 
         host, port = target
-        sock = socket.create_connection((host, port), timeout=10)
+        report_status(self.on_status, "connecting", f"正在连接 Windows：{host}:{port}")
+        sock = self._open_socket((host, port))
         try:
             result = authenticate_client(sock, self.pairing_code,
                                          capabilities=("clipboard_v2", "control_status_v1"))
+            sock.settimeout(None)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            with self.lock:
+                if self.stop_event.is_set():
+                    raise OSError("Connection attempt cancelled")
+                self._close_socket_locked()
+                self.host = host
+                self.port = port
+                self.sock = sock
+                self.capabilities = set(result.get("capabilities", []))
+                self.last_heartbeat_ack = time.monotonic()
+                self.pending_heartbeats.clear()
+                self.send_started_at = None
         except Exception:
             sock.close()
             raise
-        sock.settimeout(None)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        with self.lock:
-            self._close_socket_locked()
-            self.host = host
-            self.port = port
-            self.sock = sock
-            self.capabilities = set(result.get("capabilities", []))
-            self.last_heartbeat_ack = time.monotonic()
-            self.pending_heartbeats.clear()
-            self.send_started_at = None
+        finally:
+            with self.lock:
+                if self._connecting_sock is sock:
+                    self._connecting_sock = None
         self._start_reader(sock)
+
+    def _open_socket(self, target: tuple[str, int]) -> socket.socket:
+        """Keep a pending socket reachable by close(), including during connect/auth."""
+        deadline = time.monotonic() + 10
+        last_error: OSError = OSError("No Windows address is available")
+        for family, kind, proto, _, address in socket.getaddrinfo(*target, type=socket.SOCK_STREAM):
+            if self.stop_event.is_set():
+                raise OSError("Connection attempt cancelled")
+            sock = socket.socket(family, kind, proto)
+            try:
+                with self.lock:
+                    if self.stop_event.is_set():
+                        raise OSError("Connection attempt cancelled")
+                    self._connecting_sock = sock
+                sock.setblocking(False)
+                result = sock.connect_ex(address)
+                if result not in {0, errno.EISCONN, errno.EINPROGRESS, errno.EWOULDBLOCK,
+                                  errno.EALREADY, errno.EINTR}:
+                    raise OSError(result, os.strerror(result))
+                while result not in {0, errno.EISCONN}:
+                    if self.stop_event.is_set():
+                        raise OSError("Connection attempt cancelled")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Windows connection timed out")
+                    _, writable, exceptional = select.select([], [sock], [sock], min(0.1, remaining))
+                    if writable or exceptional:
+                        result = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                        if result:
+                            raise OSError(result, os.strerror(result))
+                sock.settimeout(10)
+                return sock
+            except (OSError, ValueError) as exc:
+                sock.close()
+                with self.lock:
+                    if self._connecting_sock is sock:
+                        self._connecting_sock = None
+                if self.stop_event.is_set():
+                    raise OSError("Connection attempt cancelled") from exc
+                last_error = exc if isinstance(exc, OSError) else OSError(str(exc))
+        raise last_error
 
     def send(self, event: dict[str, Any]) -> bool:
         data = encode_event(event)
@@ -224,8 +290,18 @@ class EventSender:
 
     def close(self) -> None:
         self.stop_event.set()
+        self.send_wakeup.set()
         with self.lock:
             self._close_socket_locked()
+            pending = self._connecting_sock
+            self._connecting_sock = None
+            if pending is not None:
+                try:
+                    pending.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                pending.close()
+        self._clear_send_queue()
 
     def set_reconnect_callback(self, callback: Callable[[], None]) -> None:
         self.reconnect_callback = callback
@@ -235,6 +311,14 @@ class EventSender:
 
     def set_incoming_handler(self, handler: IncomingEventHandler) -> None:
         self.incoming_handler = handler
+
+    def wait_closed(self, timeout: float = 1.0) -> None:
+        """Bounded cleanup, called by the owning worker rather than the UI thread."""
+        deadline = time.monotonic() + timeout
+        workers = [self.writer_thread, self.heartbeat_thread, self.reconnect_thread, *self.reader_threads]
+        for worker in workers:
+            if worker is not None and worker is not threading.current_thread():
+                worker.join(timeout=max(0, deadline - time.monotonic()))
 
     def _close_socket_locked(self) -> None:
         if self.sock is None:
@@ -296,7 +380,10 @@ class EventSender:
                     except OSError:
                         self.connect()
             except OSError as exc:
+                if self.stop_event.is_set():
+                    return
                 print(f"Reconnect failed: {exc}", flush=True)
+                report_status(self.on_status, "disconnected", f"重连失败：{exc}")
                 self.stop_event.wait(self.reconnect_delay)
                 continue
 
@@ -309,11 +396,14 @@ class EventSender:
                 return
 
     def _start_reader(self, sock: socket.socket) -> None:
-        threading.Thread(
+        worker = threading.Thread(
             target=self._reader_loop,
             args=(sock,),
             daemon=True,
-        ).start()
+        )
+        self.reader_threads = [thread for thread in self.reader_threads if thread.is_alive()]
+        self.reader_threads.append(worker)
+        worker.start()
 
     def _reader_loop(self, sock: socket.socket) -> None:
         try:
@@ -412,8 +502,10 @@ class MacControllerClient:
         auto_switch_edge: str = "off",
         edge_margin: int = 2,
         edge_monitors: dict[str, int] | None = None,
+        on_status: StatusCallback | None = None,
     ) -> None:
         self.sender = sender
+        self.on_status = on_status
         self.mouse_scale = mouse_scale
         self.map_cmd_to_ctrl = map_cmd_to_ctrl
         self.debug_keys = debug_keys
@@ -461,6 +553,7 @@ class MacControllerClient:
                 self.session_id = uuid.uuid4().hex
             # Never capture local input if the activation cannot be queued.
             if not self.sender.send(self.control_event(enabled, position)) and enabled:
+                report_status(self.on_status, "error", "无法发送控制请求，请检查 Windows 连接。")
                 return False
             self._cancel_control_timer()
             capabilities = getattr(self.sender, "capabilities", set())
@@ -479,10 +572,13 @@ class MacControllerClient:
                 self.control_timer.daemon = True
                 self.control_timer.start()
                 print("Waiting for Windows to confirm control; Mac input remains available.", flush=True)
+                report_status(self.on_status, "local", "正在等待 Windows 确认，Mac 输入保持可用。", pending=True)
                 return True
 
         state = "ON" if enabled else "OFF"
         print(f"Control Windows mode: {state}", flush=True)
+        report_status(self.on_status, "controlling" if enabled else "local",
+                      "正在控制 Windows" if enabled else "正在使用 Mac")
         return True
 
     def _cancel_control_timer(self) -> None:
@@ -501,6 +597,7 @@ class MacControllerClient:
             self.sender.send(self.control_event(False))
         print("Windows did not confirm control. Mac input is available; check the Windows receiver.",
               flush=True)
+        report_status(self.on_status, "error", "Windows 未确认控制，已保留 Mac 输入。")
 
     def handle_connection_lost(self) -> None:
         with self.state_lock:
@@ -524,6 +621,7 @@ class MacControllerClient:
                     self.last_mouse_pos = None
             if confirmed:
                 print("Control Windows mode: ON (confirmed by Windows)", flush=True)
+                report_status(self.on_status, "controlling", "正在控制 Windows（已确认）")
             return
         with self.state_lock:
             if event["session_id"] != self.session_id:
@@ -553,8 +651,10 @@ class MacControllerClient:
                     print(f"Could not reposition Mac cursor: {exc}", flush=True)
         if rejected:
             print(f"Windows rejected layout: {event['reason']}", flush=True)
+            report_status(self.on_status, "error", f"Windows 拒绝屏幕布局：{event['reason']}")
         else:
             print("Returned to Mac from Windows screen edge.", flush=True)
+            report_status(self.on_status, "local", "已返回 Mac")
 
     def is_enabled(self) -> bool:
         with self.state_lock:
@@ -834,8 +934,15 @@ def native_key_event(event_type: str, keycode: int) -> dict[str, Any]:
     return {"type": event_type, "key": MAC_KEYCODE_NAMES.get(keycode, "")}
 
 
-def run_native_macos_event_tap(client: MacControllerClient) -> None:
+def run_native_macos_event_tap(
+    client: MacControllerClient,
+    stop_event: threading.Event | None = None,
+    on_ready: Callable[[], None] | None = None,
+) -> None:
     import Quartz
+
+    if stop_event is not None and stop_event.is_set():
+        return
 
     main_display_bounds = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
     screen_min_x = float(main_display_bounds.origin.x)
@@ -956,6 +1063,8 @@ def run_native_macos_event_tap(client: MacControllerClient) -> None:
         return event
 
     def callback(proxy: Any, event_type: int, event: Any, refcon: Any) -> Any:
+        if stop_event is not None and stop_event.is_set():
+            return event
         # Serialize local input with return notifications from the socket reader.
         with client.state_lock:
             return process_event(proxy, event_type, event, refcon)
@@ -982,23 +1091,40 @@ def run_native_macos_event_tap(client: MacControllerClient) -> None:
 
     if event_tap is None:
         raise RuntimeError(
-            "Cannot create macOS event tap. Enable Accessibility and Input Monitoring for Terminal."
+            "Cannot create macOS event tap. Enable Accessibility and Input Monitoring "
+            "for CrossKey (or the terminal/Python used to launch it), then restart it."
         )
 
-    run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, event_tap, 0)
-    Quartz.CFRunLoopAddSource(
-        Quartz.CFRunLoopGetCurrent(),
-        run_loop_source,
-        Quartz.kCFRunLoopCommonModes,
-    )
-    Quartz.CGEventTapEnable(event_tap, True)
-    print(f"macOS native event tap is ON: {selected_tap_name}", flush=True)
-    if selected_tap_name != "HID":
-        print(
-            "WARNING: HID event tap was not available. Local Mac input may not be fully blocked.",
-            flush=True,
-        )
-    Quartz.CFRunLoopRun()
+    run_loop = Quartz.CFRunLoopGetCurrent()
+    run_loop_source = None
+    try:
+        run_loop_source = Quartz.CFMachPortCreateRunLoopSource(None, event_tap, 0)
+        if run_loop_source is None:
+            raise RuntimeError("Cannot create macOS input run-loop source")
+        Quartz.CFRunLoopAddSource(run_loop, run_loop_source, Quartz.kCFRunLoopCommonModes)
+        Quartz.CGEventTapEnable(event_tap, True)
+        print(f"macOS native event tap is ON: {selected_tap_name}", flush=True)
+        if selected_tap_name != "HID":
+            print("WARNING: HID event tap was not available. Local Mac input may not be fully blocked.",
+                  flush=True)
+        if on_ready is not None:
+            on_ready()
+        if stop_event is None:
+            Quartz.CFRunLoopRun()
+        else:
+            # The worker owns this CFRunLoop; Tk owns the main thread's UI loop.
+            # A bounded activation also handles a stop arriving just before entry.
+            while not stop_event.is_set():
+                Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 0.1, False)
+    finally:
+        client.handle_connection_lost()
+        client.warp_cursor = None
+        Quartz.CGEventTapEnable(event_tap, False)
+        Quartz.CFRunLoopStop(run_loop)
+        if run_loop_source is not None:
+            Quartz.CFRunLoopRemoveSource(run_loop, run_loop_source, Quartz.kCFRunLoopCommonModes)
+            Quartz.CFRunLoopSourceInvalidate(run_loop_source)
+        Quartz.CFMachPortInvalidate(event_tap)
 
 
 def load_config() -> dict[str, Any]:
@@ -1013,14 +1139,30 @@ def discover_windows_host(discovery_port: int, timeout: float) -> tuple[str, int
     return target
 
 
-def make_connection_target_resolver(args: argparse.Namespace) -> ConnectionTargetResolver:
+def make_connection_target_resolver(
+    args: argparse.Namespace, stop_event: threading.Event | None = None
+) -> ConnectionTargetResolver:
     configured_host = args.host
     configured_port = args.port
     use_discovery = args.discover and not args.host_from_cli
 
     def resolve_target() -> tuple[str, int] | None:
+        if stop_event is not None and stop_event.is_set():
+            return None
         if use_discovery:
-            discovered = discover_windows_host(args.discovery_port, args.discovery_timeout)
+            if stop_event is None:
+                discovered = discover_windows_host(args.discovery_port, args.discovery_timeout)
+            else:
+                print(f"Searching for Windows receiver on UDP port {args.discovery_port}...", flush=True)
+                deadline = time.monotonic() + args.discovery_timeout
+                discovered = None
+                while not stop_event.is_set() and time.monotonic() < deadline:
+                    discovered = discover_receiver(args.discovery_port,
+                                                   min(0.2, max(0.001, deadline - time.monotonic())))
+                    if discovered is not None:
+                        break
+                if stop_event.is_set():
+                    return None
             if discovered is not None:
                 return discovered
             if configured_host:
@@ -1037,7 +1179,7 @@ def make_connection_target_resolver(args: argparse.Namespace) -> ConnectionTarge
     return resolve_target
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     config = load_config()
     parser = argparse.ArgumentParser(description="Capture Mac input and send it to Windows.")
     parser.add_argument("--host", help="Windows IP/host. Passing this skips UDP discovery for this run.")
@@ -1145,7 +1287,7 @@ def parse_args() -> argparse.Namespace:
         default=int(config.get("clipboard_max_bytes", DEFAULT_CLIPBOARD_MAX_BYTES)),
         help="Maximum UTF-8 text size to synchronize.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     # An explicit single-edge override also disables any saved multi-screen map.
     edge_override = args.auto_switch_edge is not None
     args.edge_monitors = {} if edge_override else dict(config.get("edge_monitors", {}))
@@ -1165,47 +1307,144 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> None:
-    # -i prevents idle system sleep while allowing the display to turn off.
-    # -w also releases the assertion if Python is terminated unexpectedly.
+def make_stoppable_listener(listener_type: type, stop_event: threading.Event, **callbacks: Any) -> Any:
+    """Adapt pynput's readiness hook without calling its unbounded wait().
+
+    The pinned pynput version calls _mark_ready after installing its native hook.
+    A stop arriving before the listener thread starts must also remain effective.
+    """
+    class StoppableListener(listener_type):
+        def __init__(self) -> None:
+            self.crosskey_ready = threading.Event()
+            self.crosskey_stopped = threading.Event()
+            super().__init__(**callbacks)
+
+        def _run(self) -> None:
+            if not stop_event.is_set() and not self.crosskey_stopped.is_set():
+                super()._run()
+
+        def _mark_ready(self) -> None:
+            super()._mark_ready()
+            self.crosskey_ready.set()
+            if stop_event.is_set() or self.crosskey_stopped.is_set():
+                self.stop()
+
+        def stop(self) -> None:
+            self.crosskey_stopped.set()
+            super().stop()
+
+    return StoppableListener()
+
+
+def wait_for_input_listeners(listeners: tuple[Any, ...], stop_event: threading.Event,
+                             timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not stop_event.is_set():
+        if any(not listener.is_alive() for listener in listeners):
+            raise RuntimeError("Input listener stopped; check Accessibility and Input Monitoring permissions.")
+        if all(listener.crosskey_ready.is_set() for listener in listeners):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Input listener did not become ready; check Accessibility and Input Monitoring permissions.")
+        stop_event.wait(min(0.05, remaining))
+    return False
+
+
+def stop_input_listeners(listeners: tuple[Any, ...]) -> None:
+    for listener in listeners:
+        if listener is not None:
+            listener.stop()
+    deadline = time.monotonic() + 1.0
+    for listener in listeners:
+        if listener is not None and listener.ident is not None:
+            try:
+                listener.join(timeout=max(0, deadline - time.monotonic()))
+            except Exception as exc:
+                # pynput.join may re-raise a callback error; other resources still need cleanup.
+                print(f"Input listener ended: {exc}", flush=True)
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    stop_event: threading.Event | None = None,
+    on_status: StatusCallback | None = None,
+) -> None:
+    """Run in the CLI thread or one GUI-owned worker, without another Python process.
+
+    A GUI must pass its status queue's ``put`` method, never a widget callback.
+    Use a fresh stop_event for each run and wait for stopped before starting again.
+    """
+    stop_event = stop_event if stop_event is not None else threading.Event()
     inhibitor = None
-    if sys.platform == "darwin":
-        try:
-            inhibitor = subprocess.Popen(
-                ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())],
-                stdin=subprocess.DEVNULL,
-            )
-            print("Mac idle sleep prevention is ON while the client is running.", flush=True)
-        except OSError as exc:
-            print(f"WARNING: Cannot prevent idle sleep: {exc}", flush=True)
     try:
-        run_client()
+        if stop_event.is_set():
+            return
+        if sys.platform == "darwin":
+            try:
+                inhibitor = subprocess.Popen(
+                    ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())],
+                    stdin=subprocess.DEVNULL,
+                )
+                print("Mac idle sleep prevention is ON while the client is running.", flush=True)
+            except OSError as exc:
+                print(f"WARNING: Cannot prevent idle sleep: {exc}", flush=True)
+        run_client(argv, stop_event=stop_event, on_status=on_status)
+    except KeyboardInterrupt:
+        stop_event.set()
+    except (Exception, SystemExit) as exc:
+        if on_status is None:
+            raise
+        if not stop_event.is_set():
+            message = str(exc) if not isinstance(exc, SystemExit) or not isinstance(exc.code, int) else "启动配置无效，请检查地址、配对码和参数。"
+            report_status(on_status, "error", message)
     finally:
         if inhibitor is not None:
-            inhibitor.terminate()
-            inhibitor.wait()
+            try:
+                inhibitor.terminate()
+                inhibitor.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                inhibitor.kill()
+                inhibitor.wait(timeout=2)
+            except OSError:
+                pass
+        report_status(on_status, "stopped", "已停止，Mac 输入已恢复。")
 
 
-def run_client() -> None:
-    args = parse_args()
+def run_client(
+    argv: list[str] | None = None,
+    *,
+    stop_event: threading.Event | None = None,
+    on_status: StatusCallback | None = None,
+) -> None:
+    stop_event = stop_event if stop_event is not None else threading.Event()
+    if stop_event.is_set():
+        return
+    args = parse_args(argv)
     if (args.auto_switch_edge != "off" or args.edge_monitors) and (
         sys.platform != "darwin" or not args.suppress_local_mouse
     ):
-        print(
-            "WARNING: edge switching requires macOS native input suppression; "
-            "edge switching is disabled for this run.",
-            flush=True,
-        )
+        print("WARNING: edge switching requires macOS native input suppression; "
+              "edge switching is disabled for this run.", flush=True)
         args.auto_switch_edge = "off"
         args.edge_monitors = {}
     print(f"CrossKey Mac v{__version__}", flush=True)
-    resolve_target = make_connection_target_resolver(args)
+
+    finished = threading.Event()
+    input_ready = threading.Event()
+
+    def status(event: dict[str, Any]) -> None:
+        if not stop_event.is_set() and not finished.is_set():
+            report_status(on_status, **event)
+
+    report_status(status, "connecting", "正在寻找 Windows 接收端…")
+    resolve_target = make_connection_target_resolver(args, stop_event)
     initial_target = resolve_target()
+    if stop_event.is_set():
+        return
     if initial_target is None:
-        raise SystemExit(
-            "Missing Windows host. Start win_server.py for auto discovery, set config.json, "
-            "or pass --host 192.168.x.x"
-        )
+        raise RuntimeError("未找到 Windows 接收端。请启动 Windows 程序，或设置接收端地址。")
 
     sender = EventSender(
         resolve_target,
@@ -1213,129 +1452,124 @@ def run_client() -> None:
         pairing_code=args.pairing_code,
         heartbeat_interval=args.heartbeat_interval,
         response_timeout=args.heartbeat_timeout,
+        on_status=status,
     )
-    initial_host, initial_port = initial_target
-    print(f"Connecting to Windows at {initial_host}:{initial_port}...", flush=True)
+    client = None
+    clipboard_sync = None
+    mouse_listener = keyboard_listener = None
+
+    def watch_stop() -> None:
+        while not finished.wait(0.05):
+            if stop_event.is_set():
+                if client is not None:
+                    client.handle_connection_lost()
+                sender.close()
+                return
+
+    stopper = threading.Thread(target=watch_stop, name="CrossKey-stop", daemon=True)
+    stopper.start()
+
+    def report_connected() -> None:
+        input_ready.set()
+        with sender.lock:
+            connected = sender.sock is not None
+            host, port = sender.host, sender.port
+        if connected:
+            report_status(status, "connected", "已连接 Windows，按 F8 或移至屏幕边缘开始控制。",
+                          host=host, port=port)
+
     try:
-        sender.connect(initial_target)
-    except (OSError, AuthenticationError, ValueError) as exc:
-        sender.close()
-        print("", flush=True)
-        print(f"ERROR: Cannot connect to Windows: {exc}", flush=True)
-        print("", flush=True)
-        print("请检查：", flush=True)
-        print("1. Windows 端是否正在运行 python win_server.py", flush=True)
-        print("2. Windows 防火墙是否允许 Python", flush=True)
-        print(f"3. Windows 当前 IP 是否还是 {initial_host}", flush=True)
-        print("4. Mac 和 Windows 是否还在同一个局域网/Wi-Fi", flush=True)
-        return
-    if args.edge_monitors and "monitor_mapping_v1" not in sender.capabilities:
-        sender.close()
-        raise SystemExit("Multi-monitor mapping requires Windows receiver v0.5.0 or newer. "
-                         "Update and restart win_server.py first.")
-    print("Connected and authenticated with Windows", flush=True)
-    if "control_status_v1" not in sender.capabilities:
-        print("Windows receiver has no control/heartbeat confirmation. Update both ends for response checks.",
-              flush=True)
-    print("Press F8 to control Windows. Press F8 again to stop.", flush=True)
-    print("If F8 is a media key, use Control + Option + Command + 8.", flush=True)
-    if args.suppress_local_mouse and sys.platform == "darwin":
-        print("Mac local input suppression is ON only in control mode.", flush=True)
-    elif args.suppress_local_mouse:
-        print("Mac local mouse suppression is ON. Press Ctrl+C to quit.", flush=True)
-    if args.map_cmd_to_ctrl:
-        print("Mac Command is mapped to Windows Ctrl for shortcuts.", flush=True)
-    if args.debug_keys:
-        print("Keyboard debug logging is ON.", flush=True)
-    if args.edge_monitors:
-        for edge in EDGE_ORDER:
-            if edge in args.edge_monitors:
-                print(f"Mac {edge} edge -> Windows monitor {args.edge_monitors[edge]}", flush=True)
-    elif args.auto_switch_edge != "off":
-        print(
-            f"Mac {args.auto_switch_edge} edge activates Windows control; "
-            "the opposite Windows edge or F8 returns to Mac.",
-            flush=True,
+        initial_host, initial_port = initial_target
+        print(f"Connecting to Windows at {initial_host}:{initial_port}...", flush=True)
+        try:
+            sender.connect(initial_target)
+        except (OSError, AuthenticationError, ValueError) as exc:
+            if stop_event.is_set():
+                return
+            raise RuntimeError(f"无法连接 Windows {initial_host}:{initial_port}：{exc}") from exc
+        if stop_event.is_set():
+            return
+        if args.edge_monitors and "monitor_mapping_v1" not in sender.capabilities:
+            raise RuntimeError("Multi-monitor mapping requires Windows receiver v0.5.0 or newer. "
+                               "Update and restart win_server.py first.")
+        print("Connected and authenticated with Windows", flush=True)
+        if "control_status_v1" not in sender.capabilities:
+            print("Windows receiver has no control/heartbeat confirmation. Update both ends for response checks.",
+                  flush=True)
+        print("Press F8 to control Windows. Press F8 again to stop.", flush=True)
+        print("If F8 is a media key, use Control + Option + Command + 8.", flush=True)
+        if args.suppress_local_mouse:
+            print("Mac local input suppression is ON only in control mode.", flush=True)
+        if args.map_cmd_to_ctrl:
+            print("Mac Command is mapped to Windows Ctrl for shortcuts.", flush=True)
+        if args.debug_keys:
+            print("Keyboard debug logging is ON.", flush=True)
+        if args.edge_monitors:
+            for edge in EDGE_ORDER:
+                if edge in args.edge_monitors:
+                    print(f"Mac {edge} edge -> Windows monitor {args.edge_monitors[edge]}", flush=True)
+        elif args.auto_switch_edge != "off":
+            print(f"Mac {args.auto_switch_edge} edge activates Windows control; "
+                  "the opposite Windows edge or F8 returns to Mac.", flush=True)
+
+        client = MacControllerClient(sender, args.mouse_scale, args.map_cmd_to_ctrl, args.debug_keys,
+                                     args.auto_switch_edge, args.edge_margin, args.edge_monitors,
+                                     on_status=status)
+        clipboard_sync = ClipboardSync(
+            sender.send, client.is_enabled, "mac", "Windows", args.sync_clipboard,
+            args.clipboard_only_control_mode, args.clipboard_poll_interval,
+            args.clipboard_max_bytes, supports_extended=lambda: "clipboard_v2" in sender.capabilities,
         )
 
-    client = MacControllerClient(
-        sender,
-        args.mouse_scale,
-        args.map_cmd_to_ctrl,
-        args.debug_keys,
-        args.auto_switch_edge,
-        args.edge_margin,
-        args.edge_monitors,
-    )
-    clipboard_sync = ClipboardSync(
-        sender.send,
-        client.is_enabled,
-        "mac",
-        "Windows",
-        args.sync_clipboard,
-        args.clipboard_only_control_mode,
-        args.clipboard_poll_interval,
-        args.clipboard_max_bytes,
-        supports_extended=lambda: "clipboard_v2" in sender.capabilities,
-    )
-    def recover_after_reconnect() -> None:
-        clipboard_sync.reset_connection()
+        def recover_after_reconnect() -> None:
+            clipboard_sync.reset_connection()
+            if input_ready.is_set():
+                report_connected()
 
-    sender.set_reconnect_callback(recover_after_reconnect)
-    sender.set_disconnect_callback(client.handle_connection_lost)
-    def handle_incoming_event(event: dict[str, Any]) -> None:
-        if event.get("type") in {"return_control", "control_rejected", "control_ack"}:
-            client.handle_remote_event(event)
-        else:
-            clipboard_sync.submit_remote_event(event)
-
-    sender.set_incoming_handler(handle_incoming_event)
-    clipboard_sync.start()
-    if args.suppress_local_mouse and sys.platform == "darwin":
-        try:
-            run_native_macos_event_tap(client)
-        except RuntimeError as exc:
-            print("", flush=True)
-            print(f"ERROR: {exc}", flush=True)
-            print("", flush=True)
-            print("请在 macOS 打开这两个权限，然后重新运行：", flush=True)
-            print("1. 系统设置 -> 隐私与安全性 -> 辅助功能", flush=True)
-            print("2. 系统设置 -> 隐私与安全性 -> 输入监控", flush=True)
-            print("", flush=True)
-            print("这两个页面里都要打开 Terminal。", flush=True)
-            print("如果还是失败，再把 Python / Python Launcher 也加入并打开。", flush=True)
-            print("Python 位置通常在：/Applications/Python 3.14/", flush=True)
-            print("", flush=True)
-            print("临时不拦截 Mac 本机输入也可以这样启动：", flush=True)
-            print("python3 mac_client.py --no-suppress-local-mouse", flush=True)
-        except KeyboardInterrupt:
-            pass
-        finally:
+        def disconnected() -> None:
             client.handle_connection_lost()
-            clipboard_sync.stop()
-            sender.close()
-        return
+            report_status(status, "disconnected", "Windows 连接已断开，Mac 输入已恢复；正在重连。")
 
-    mouse_listener = mouse.Listener(
-        on_move=client.on_mouse_move,
-        on_click=client.on_mouse_click,
-        on_scroll=client.on_mouse_scroll,
-        suppress=args.suppress_local_mouse,
-    )
-    keyboard_listener = keyboard.Listener(
-        on_press=client.on_key_down,
-        on_release=client.on_key_up,
-    )
+        def handle_incoming_event(event: dict[str, Any]) -> None:
+            if event.get("type") in {"return_control", "control_rejected", "control_ack"}:
+                client.handle_remote_event(event)
+            else:
+                clipboard_sync.submit_remote_event(event)
 
-    try:
-        mouse_listener.start()
-        keyboard_listener.start()
-        keyboard_listener.join()
+        sender.set_reconnect_callback(recover_after_reconnect)
+        sender.set_disconnect_callback(disconnected)
+        sender.set_incoming_handler(handle_incoming_event)
+        clipboard_sync.start()
+        if args.suppress_local_mouse and sys.platform == "darwin":
+            run_native_macos_event_tap(client, stop_event, report_connected)
+        else:
+            if stop_event.is_set():
+                return
+            mouse_listener = make_stoppable_listener(mouse.Listener, stop_event,
+                on_move=client.on_mouse_move, on_click=client.on_mouse_click,
+                on_scroll=client.on_mouse_scroll, suppress=args.suppress_local_mouse,
+            )
+            keyboard_listener = make_stoppable_listener(keyboard.Listener, stop_event,
+                                                        on_press=client.on_key_down, on_release=client.on_key_up)
+            mouse_listener.start()
+            keyboard_listener.start()
+            if not wait_for_input_listeners((mouse_listener, keyboard_listener), stop_event):
+                return
+            report_connected()
+            while not stop_event.wait(0.1):
+                if not keyboard_listener.is_alive() or not mouse_listener.is_alive():
+                    raise RuntimeError("Input listener stopped; check input-monitoring permissions.")
     finally:
-        client.handle_connection_lost()
-        mouse_listener.stop()
-        clipboard_sync.stop()
+        finished.set()
+        if client is not None:
+            client.handle_connection_lost()
+        stop_input_listeners((mouse_listener, keyboard_listener))
+        mouse_listener = keyboard_listener = None
+        if clipboard_sync is not None:
+            clipboard_sync.stop()
         sender.close()
+        stopper.join(timeout=0.5)
+        sender.wait_closed()
 
 
 if __name__ == "__main__":

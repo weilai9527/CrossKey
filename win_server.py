@@ -29,6 +29,46 @@ DEFAULT_DISCOVERY_PORT = 5051
 DEFAULT_CLIPBOARD_POLL_INTERVAL = 0.7
 DEFAULT_CLIPBOARD_MAX_BYTES = 262144
 DEFAULT_HEARTBEAT_TIMEOUT = 30.0
+StatusCallback = Callable[[dict[str, Any]], None]
+_receiver_run_lock = threading.Lock()
+
+
+def _emit_status(callback: StatusCallback | None, state: str, **details: Any) -> None:
+    """Callbacks run on the receiver worker; GUI callers should enqueue them."""
+    if callback is None:
+        return
+    try:
+        callback({"state": state, **details})
+    except Exception as exc:
+        try:
+            print(f"Receiver status callback failed: {exc}", flush=True)
+        except Exception:
+            pass
+
+
+def _shutdown_connection(conn: socket.socket | None) -> None:
+    if conn is None:
+        return
+    try:
+        conn.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def _monitor_status() -> dict[str, Any]:
+    try:
+        monitors = list_monitors()
+        return {"monitors": [
+            {"number": monitor.number, "device": monitor.device,
+             "x": monitor.bounds.left, "y": monitor.bounds.top,
+             "width": monitor.bounds.right - monitor.bounds.left,
+             "height": monitor.bounds.bottom - monitor.bounds.top,
+             "primary": monitor.primary}
+            for monitor in monitors.values()
+        ]}
+    except Exception as exc:
+        # Monitor discovery is useful GUI context, not a reason to refuse TCP.
+        return {"monitors": [], "monitor_error": str(exc)}
 
 
 # Keep primary-screen metrics and cursor coordinates in the same pixel space.
@@ -346,6 +386,9 @@ def handle_client(
     clipboard_max_bytes: int,
     pairing_code: str,
     heartbeat_timeout: float,
+    *,
+    stop_event: threading.Event | None = None,
+    on_status: StatusCallback | None = None,
 ) -> None:
     global control_mode_enabled
 
@@ -355,13 +398,25 @@ def handle_client(
         peer = authenticate_server(conn, pairing_code,
                                    capabilities=("monitor_mapping_v1", "clipboard_v2", "control_status_v1"))
     except (AuthenticationError, OSError, ValueError) as exc:
-        print(f"Authentication failed for {address[0]}: {exc}", flush=True)
+        if stop_event is None or not stop_event.is_set():
+            print(f"Authentication failed for {address[0]}: {exc}", flush=True)
+            _emit_status(on_status, "error", stage="authentication", fatal=False,
+                         message=str(exc), peer_host=address[0], peer_port=address[1])
         conn.close()
         client_connected.clear()
-        time.sleep(1)
+        if stop_event is None:
+            time.sleep(1)
+        else:
+            stop_event.wait(1)
+        return
+    if stop_event is not None and stop_event.is_set():
+        conn.close()
+        client_connected.clear()
         return
     print("Mac authenticated", flush=True)
     print("Now press F8 on Mac, or Control + Option + Command + 8.", flush=True)
+    _emit_status(on_status, "connected", peer_host=address[0], peer_port=address[1],
+                 control_enabled=False)
     conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     conn.settimeout(heartbeat_timeout)
     send_lock = threading.Lock()
@@ -371,6 +426,11 @@ def handle_client(
         try:
             with send_lock:
                 conn.sendall(encode_event(event))
+            if event["type"] == "return_control":
+                _emit_status(on_status, "local", control_enabled=False)
+            elif event["type"] == "control_rejected":
+                _emit_status(on_status, "error", stage="layout", fatal=False,
+                             message=event["reason"], control_enabled=False)
             return True
         except OSError as exc:
             print(f"Send to Mac failed: {exc}", flush=True)
@@ -391,7 +451,9 @@ def handle_client(
     clipboard_sync.start()
     with conn, conn.makefile("rb") as reader:
         try:
-            while line := reader.readline(MAX_EVENT_LINE_BYTES + 1):
+            while (stop_event is None or not stop_event.is_set()) and (
+                line := reader.readline(MAX_EVENT_LINE_BYTES + 1)
+            ):
                 if len(line) > MAX_EVENT_LINE_BYTES:
                     print("Bad event: event is too large", flush=True)
                     break
@@ -409,24 +471,31 @@ def handle_client(
                     else:
                         if not edge_return.handle(event):
                             break
-                        if (supports_control_status and event["type"] == "control_mode"
-                                and "session_id" in event
+                        if (event["type"] == "control_mode"
                                 and event["enabled"] == control_mode_enabled):
                             # A rejected layout already sent control_rejected; never
                             # follow that rejection with a successful control reply.
-                            if not send_server_event({"type": "control_ack",
-                                                      "session_id": event["session_id"],
-                                                      "enabled": control_mode_enabled}):
-                                break
+                            if supports_control_status and "session_id" in event:
+                                if not send_server_event({"type": "control_ack",
+                                                          "session_id": event["session_id"],
+                                                          "enabled": control_mode_enabled}):
+                                    break
+                            _emit_status(on_status, "controlling" if control_mode_enabled else "local",
+                                         control_enabled=control_mode_enabled)
                 except Exception as exc:
                     print(f"Bad event: {exc}", flush=True)
         except (OSError, TimeoutError) as exc:
-            print(f"Mac connection ended: {exc}", flush=True)
+            if stop_event is None or not stop_event.is_set():
+                print(f"Mac connection ended: {exc}", flush=True)
+                _emit_status(on_status, "error", stage="receive", fatal=False,
+                             message=str(exc), peer_host=address[0], peer_port=address[1])
         finally:
             clipboard_sync.stop()
             release_all_remote_inputs()
             control_mode_enabled = False
             client_connected.clear()
+            _emit_status(on_status, "disconnected", peer_host=address[0], peer_port=address[1],
+                         control_enabled=False)
     print("Mac disconnected", flush=True)
     print("Discovery broadcast resumed", flush=True)
 
@@ -441,58 +510,153 @@ def serve(
     discovery_port: int,
     pairing_code: str,
     heartbeat_timeout: float,
+    *,
+    stop_event: threading.Event | None = None,
+    on_status: StatusCallback | None = None,
 ) -> None:
-    client_connected = threading.Event()
+    """Run the receiver in the caller's thread; set stop_event to shut it down.
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        if sys.platform == "win32":
-            # On Windows SO_REUSEADDR can let two receivers share a listening
-            # port, making the process that accepts a connection unpredictable.
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        else:
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            server.bind((host, port))
-        except OSError as exc:
-            if exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) in {10048, 10013}:
-                hint = (
-                    f"Port {port} may already be in use or reserved. Close the existing CrossKey "
-                    "Windows receiver before starting another one. "
-                    f"On Windows, use netstat -ano to check the listening PID for port {port}."
-                )
+    on_status receives dictionaries on worker threads, never on a GUI main loop.
+    An embedding UI must queue updates and should create a new Event for each run.
+    """
+    global control_mode_enabled
+
+    bound_port = port
+
+    def status(state: str, **details: Any) -> None:
+        _emit_status(on_status, state, host=host, port=bound_port, **details)
+
+    def client_status(event: dict[str, Any]) -> None:
+        status(event["state"], **{key: value for key, value in event.items() if key != "state"})
+
+    if not _receiver_run_lock.acquire(blocking=False):
+        message = "A Windows receiver is already running in this process. Stop it before starting another one."
+        status("error", stage="startup", fatal=True, message=message)
+        status("stopped", message=message)
+        raise RuntimeError(message)
+
+    client_connected = threading.Event()
+    run_stop = threading.Event()
+    finished = threading.Event()
+    connection_lock = threading.Lock()
+    active_connection: socket.socket | None = None
+    discovery_thread: threading.Thread | None = None
+    cancellation_thread: threading.Thread | None = None
+    failure_message = ""
+    failure_stage = "startup"
+
+    def cancel_when_requested() -> None:
+        while not finished.wait(0.05):
+            if stop_event is not None and stop_event.is_set():
+                run_stop.set()
+                with connection_lock:
+                    conn = active_connection
+                # shutdown interrupts recv/readline/sendall, including the auth
+                # handshake. close alone cannot reliably wake a makefile reader.
+                _shutdown_connection(conn)
+                return
+
+    try:
+        if stop_event is not None and stop_event.is_set():
+            return
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            if sys.platform == "win32":
+                # Windows REUSEADDR permits competing listeners on one port.
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             else:
-                hint = "Check that the requested IP belongs to this computer and the port is available."
-            raise SystemExit(f"ERROR: Cannot bind Windows receiver to {host}:{port}: {exc}\n{hint}") from exc
-        server.listen(1)
-        discovery_thread = threading.Thread(
-            target=broadcast_receiver,
-            args=(port, discovery_port, client_connected),
-            daemon=True,
-        )
-        discovery_thread.start()
-        print(f"CrossKey Windows v{__version__}", flush=True)
-        print("Windows Receiver started", flush=True)
-        print(f"Receiver PID: {os.getpid()}", flush=True)
-        print(f"Receiver script: {Path(__file__).resolve()}", flush=True)
-        print(f"Listening on {host}:{port}", flush=True)
-        print(f"Broadcasting discovery on UDP port {discovery_port}", flush=True)
-        print(f"Pairing code: {pairing_code}", flush=True)
-        while True:
-            print("Waiting for Mac connection...", flush=True)
-            conn, address = server.accept()
-            client_connected.set()
-            print("Discovery broadcast paused while Mac is connected", flush=True)
-            handle_client(
-                conn,
-                address,
-                client_connected,
-                sync_clipboard,
-                clipboard_only_control_mode,
-                clipboard_poll_interval,
-                clipboard_max_bytes,
-                pairing_code,
-                heartbeat_timeout,
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                server.bind((host, port))
+            except OSError as exc:
+                if exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) in {10048, 10013}:
+                    hint = (
+                        f"Port {port} may already be in use or reserved. Close the existing CrossKey "
+                        "Windows receiver before starting another one. "
+                        f"On Windows, use netstat -ano to check the listening PID for port {port}."
+                    )
+                else:
+                    hint = "Check that the requested IP belongs to this computer and the port is available."
+                failure_message = f"ERROR: Cannot bind Windows receiver to {host}:{port}: {exc}\n{hint}"
+                status("error", stage="bind", fatal=True, message=failure_message)
+                raise SystemExit(failure_message) from exc
+            server.listen(1)
+            if port == 0:
+                bound_port = server.getsockname()[1]
+            if stop_event is not None:
+                server.settimeout(0.2)
+                cancellation_thread = threading.Thread(
+                    target=cancel_when_requested, name="crosskey-receiver-stop", daemon=True,
+                )
+                cancellation_thread.start()
+            discovery_thread = threading.Thread(
+                target=broadcast_receiver,
+                args=(bound_port, discovery_port, client_connected, run_stop),
+                name="crosskey-receiver-discovery", daemon=True,
             )
+            discovery_thread.start()
+            print(f"CrossKey Windows v{__version__}", flush=True)
+            print("Windows Receiver started", flush=True)
+            print(f"Receiver PID: {os.getpid()}", flush=True)
+            print(f"Receiver script: {Path(__file__).resolve()}", flush=True)
+            print(f"Listening on {host}:{bound_port}", flush=True)
+            print(f"Broadcasting discovery on UDP port {discovery_port}", flush=True)
+            print(f"Pairing code: {pairing_code}", flush=True)
+            status("listening", **(_monitor_status() if on_status is not None else {}))
+            failure_stage = "receive"
+            print("Waiting for Mac connection...", flush=True)
+            while stop_event is None or not stop_event.is_set():
+                try:
+                    conn, address = server.accept()
+                except socket.timeout:
+                    continue
+                with connection_lock:
+                    active_connection = conn
+                if stop_event is not None and stop_event.is_set():
+                    _shutdown_connection(conn)
+                    conn.close()
+                    break
+                client_connected.set()
+                print("Discovery broadcast paused while Mac is connected", flush=True)
+                try:
+                    handle_client(
+                        conn, address, client_connected,
+                        sync_clipboard, clipboard_only_control_mode,
+                        clipboard_poll_interval, clipboard_max_bytes,
+                        pairing_code, heartbeat_timeout,
+                        stop_event=stop_event, on_status=client_status,
+                    )
+                finally:
+                    _shutdown_connection(conn)
+                    conn.close()
+                    with connection_lock:
+                        active_connection = None
+                    client_connected.clear()
+                if stop_event is None or not stop_event.is_set():
+                    print("Waiting for Mac connection...", flush=True)
+    except Exception as exc:
+        if stop_event is None or not stop_event.is_set():
+            failure_message = str(exc)
+            status("error", stage=failure_stage, fatal=True, message=failure_message)
+            raise
+    finally:
+        finished.set()
+        run_stop.set()
+        with connection_lock:
+            conn = active_connection
+        _shutdown_connection(conn)
+        if conn is not None:
+            conn.close()
+        release_all_remote_inputs()
+        control_mode_enabled = False
+        client_connected.clear()
+        try:
+            for worker in (cancellation_thread, discovery_thread):
+                if (worker is not None and worker is not threading.current_thread()
+                        and worker.is_alive()):
+                    worker.join(timeout=0.5)
+        finally:
+            _receiver_run_lock.release()
+            status("stopped", message=failure_message, control_enabled=False)
 
 
 def parse_args() -> argparse.Namespace:

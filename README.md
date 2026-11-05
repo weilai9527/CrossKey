@@ -8,6 +8,56 @@ Mac 捕获键盘/鼠标事件 -> TCP 发送 -> Windows 接收 -> 模拟键盘/�
 
 使用 F8 快捷键切换控制模式，不传画面，也不是远程桌面。
 
+## v0.7.0 更新：轻量启动窗口
+
+新增双击启动的小窗口。Windows 显示当前本机局域网 IPv4、端口、配对码和实际
+显示器排列，一键开启或停止接收；Mac 显示连接状态和已保存的穿屏布局，在
+「设置」中填写 Windows 地址、配对码、端口、剪贴板选项和各边缘对应的屏幕编号。
+首次使用时先开启 Windows 接收，再在 Mac 保存配对码并连接。
+
+窗口使用 Python 自带的 Tkinter/Tcl/Tk，控制核心与窗口共用主进程及现有连接，
+不需要浏览器运行时。日志只保留最近 200 行、每行最多 2000 字符，并遮蔽配对码。
+实际内存会随平台、Python 和剪贴板内容变化；窗口关闭不代表 Python 运行时全部卸载。
+
+- **重复双击**：唤醒已有启动窗口，避免重复启动另一份桌面接收端/客户端。
+- **连接或接收正在运行时关闭窗口**：销毁界面视图、停止界面刷新，继续保持控制服务；
+  再次双击启动脚本即可恢复窗口。Mac 也可通过应用菜单重新显示窗口。
+- **未启动或已经停止时关闭窗口**：退出程序。
+- **点击「退出程序」**：停止连接、释放远程键鼠状态和本机监听，退出程序。
+  Mac 的防空闲睡眠状态也随控制核心退出而恢复。
+
+IP 取自本机网卡配置，不向互联网探测。如果同时连接 Wi-Fi、有线或 VPN，可能
+显示多个地址；在 Mac 选择与其处于同一局域网的 Windows 地址。自动发现失败时
+仍可手动填 IP。IPv4、显示器检测可手动刷新，窗口可见时也会定期刷新。
+
+### 从旧版本更新
+
+先退出两端已有的 CrossKey 程序。旧命令行窗口使用 `Ctrl+C`；请只退出 CrossKey，
+不要结束其他无关的 Python 程序。启动器会提示仍在运行的 Mac 命令行客户端，
+Windows 则保留独占端口保护。旧 CLI 和新启动器不要同时运行。
+
+在两端各自项目目录执行：
+
+```bash
+git pull --ff-only
+```
+
+已有 `config.json` 会保留。然后按以下方式启动：
+
+| 平台 | 双击启动 | 窗口中的操作 | 终端启动窗口 |
+| --- | --- | --- | --- |
+| Windows | `start_windows.bat` | 点击「开启接收」 | `python launcher.py` |
+| Mac | `start_mac.command` | 点击「连接 Windows」 | `python3 launcher.py` |
+
+Windows 脚本优先使用 `pythonw` / `pyw`，通常不保留命令行窗口；缺少 Python 或
+Tcl/Tk 时会显示错误并暂停。Mac 的 `.command` 由终端启动；界面、日志和设置在小窗口中。
+两端脚本优先使用项目中的 `.venv` 或 `venv`（若存在对应 Python）。
+如果窗口启动失败，使用表中的终端命令查看完整错误。
+
+本次为源码更新及本机打包入口；仓库内没有预先构建的 Windows `.exe` 附件。
+Windows 的启动、界面及真实输入效果仍需在 Windows 机器上验收。
+原来的 `python win_server.py` / `python3 mac_client.py` 命令行入口继续保留，见下文。
+
 ## v0.6.2 更新
 
 Windows 接收端改为独占监听端口，避免两份程序同时监听 5050，导致 Mac 连接到
@@ -34,6 +84,10 @@ Windows 重新运行 `python win_server.py`，Mac 重新运行 `python3 mac_clie
 ## 文件
 
 ```text
+launcher.py      Mac/Windows 轻量桌面启动窗口，与控制核心共用主进程
+launcher_support.py  本机 IP 检测、单实例唤醒和有界日志
+start_windows.bat    Windows 双击启动窗口
+start_mac.command    Mac 双击启动窗口
 mac_client.py    Mac 端，捕获输入并发送
 win_server.py    Windows 端，接收事件并模拟输入，并通过 UDP 广播自己的地址
 protocol.py      每行一个 JSON 的事件协议
@@ -67,7 +121,10 @@ Mac 执行（macOS 通常没有 `python` 命令，需要使用 `python3`）：
 python3 -m pip install -r requirements.txt
 ```
 
-## Windows 端启动
+桌面窗口另外需要 Python 的 Tcl/Tk 支持，`tkinter` 不通过 pip 安装。
+可使用带 Tcl/Tk 的 Python 安装包；若当前 Python 缺少此组件，命令行入口仍可使用。
+
+## Windows 命令行启动
 
 在 Windows 上先运行：
 
@@ -106,7 +163,7 @@ ipconfig
 192.168.1.25
 ```
 
-## Mac 端启动
+## Mac 命令行启动
 
 默认会先通过 UDP 广播自动发现 Windows 接收端。Windows 端运行 `python win_server.py`
 后，会显示：
@@ -161,8 +218,8 @@ python3 configure_ip.py --host 192.168.1.25 --port 5050
 python3 mac_client.py
 ```
 
-如果双击 `start_mac.command` 启动，它会先询问是否要修改 Windows IP/端口。
-默认情况下不需要修改，只有自动发现失败或 Windows IP 固定时才需要手动配置。
+从 v0.7.0 起，双击 `start_mac.command` 打开桌面窗口，在「设置」中修改 Windows
+IP、端口和配对码；上面的脚本仍可用于命令行配置。
 
 也可以临时指定 IP：
 
@@ -176,7 +233,7 @@ python3 mac_client.py --host 192.168.1.25
 python3 mac_client.py --no-discover
 ```
 
-## 使用
+## 命令行使用
 
 1. Windows 先运行 `python win_server.py`
 2. Mac 再运行 `python3 mac_client.py`
@@ -600,5 +657,15 @@ python3 build_executable.py mac
 python build_executable.py windows
 ```
 
-单文件程序输出到 `dist/`。macOS 版本仍需要辅助功能和输入监控权限；Windows
-版本首次监听网络时仍需允许防火墙访问局域网。
+默认打包桌面窗口，使用目录模式，输出到 `dist/`：macOS 打开 `CrossKey-Mac.app`；
+Windows 打开 `CrossKey-Windows` 目录内的 `CrossKey-Windows.exe`。分发时保留完整
+应用包或输出目录，不要只复制其中一个可执行文件。
+
+源码运行仍使用项目目录中的 `config.json`。打包版将配置保存到当前用户的可写目录：
+Windows 为 `%APPDATA%\CrossKey\config.json`，Mac 为
+`~/Library/Application Support/CrossKey/config.json`。从源码版切换到打包版时，
+可在首次打开前将原配置复制到对应位置，或在窗口重新填写配对码和布局。
+
+如需打包原来的命令行入口，在相同命令末尾添加 `--cli`。
+macOS 版本仍需要辅助功能和输入监控权限；Windows 版本首次监听网络时仍需允许
+防火墙访问局域网。这些命令在本机生成程序，不表示发布页已经提供对应二进制附件。

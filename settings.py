@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -8,7 +11,17 @@ from auth import validate_pairing_code
 from screen_edges import validate_edge_monitors
 
 
-CONFIG_PATH = Path(__file__).with_name("config.json")
+def default_config_path() -> Path:
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).with_name("config.json")
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+    else:
+        base = Path.home() / "Library" / "Application Support"
+    return base / "CrossKey" / "config.json"
+
+
+CONFIG_PATH = default_config_path()
 DEFAULTS: dict[str, Any] = {
     "windows_host": "",
     "host": "0.0.0.0",
@@ -31,6 +44,7 @@ DEFAULTS: dict[str, Any] = {
     "clipboard_poll_interval": 0.7,
     "clipboard_max_bytes": 262144,
     "pairing_code": "",
+    "launcher_auto_start": False,
 }
 
 
@@ -49,7 +63,19 @@ def save_settings(settings: dict[str, Any], path: Path = CONFIG_PATH) -> None:
     merged = dict(DEFAULTS)
     merged.update(settings)
     validate_settings(merged)
-    path.write_text(json.dumps(merged, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".crosskey-", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(merged, indent=2, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def validate_settings(settings: dict[str, Any]) -> None:
