@@ -82,7 +82,11 @@ class ClipboardFormatTests(unittest.TestCase):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 output = io.BytesIO()
                 with zipfile.ZipFile(output, "w") as archive:
-                    archive.writestr(name, b"payload")
+                    entry = zipfile.ZipInfo(name)
+                    # Preserve deliberately malformed raw names: ZipInfo's
+                    # constructor normalizes backslashes on Windows writers.
+                    entry.filename = name
+                    archive.writestr(entry, b"payload")
                 with self.assertRaises(ValueError):
                     unpack_files(output.getvalue(), directory=directory)
                 self.assertEqual(list(Path(directory).iterdir()), [])

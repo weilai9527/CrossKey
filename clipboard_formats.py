@@ -172,7 +172,9 @@ def unpack_files(data: bytes, *, directory: str | None = None) -> list[str]:
         seen: set[str] = set()
         roots: list[str] = []
         for entry in entries:
-            parts = _safe_parts(entry.filename)
+            # ZipInfo normalizes Windows separators (and truncates NULs) in
+            # filename. Validate the original archive name on every platform.
+            parts = _safe_parts(entry.orig_filename)
             key = "/".join(parts).casefold()
             if key in seen:
                 raise ValueError("duplicate archive path")
@@ -188,7 +190,7 @@ def unpack_files(data: bytes, *, directory: str | None = None) -> list[str]:
         folder = Path(tempfile.mkdtemp(prefix="crosskey-clipboard-", dir=directory))
         try:
             for entry in entries:
-                target = folder.joinpath(*_safe_parts(entry.filename))
+                target = folder.joinpath(*_safe_parts(entry.orig_filename))
                 if entry.is_dir():
                     target.mkdir(parents=True, exist_ok=True)
                 else:

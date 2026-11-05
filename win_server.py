@@ -4,6 +4,7 @@ import argparse
 import ctypes
 import errno
 import os
+import select
 import socket
 import sys
 import threading
@@ -33,6 +34,112 @@ StatusCallback = Callable[[dict[str, Any]], None]
 _receiver_run_lock = threading.Lock()
 
 
+class _CancellableConnection:
+    """Socket operations that observe stop without cross-thread socket closure.
+
+    Winsock shutdown does not reliably wake Python's timeout/select wait. Keep
+    the real socket nonblocking and bound each readiness wait instead. Timeout
+    changes made by authentication apply to the whole operation, not each poll.
+    """
+
+    def __init__(self, conn: socket.socket, stop_event: threading.Event):
+        self._socket = conn
+        self._stop_event = stop_event
+        self._timeout = conn.gettimeout()
+        conn.setblocking(False)
+
+    def _check_stopped(self) -> None:
+        if self._stop_event.is_set():
+            raise OSError("Receiver stopped")
+
+    def _deadline(self) -> float | None:
+        return None if self._timeout is None else time.monotonic() + self._timeout
+
+    def _wait(self, *, reading: bool, deadline: float | None) -> None:
+        while True:
+            self._check_stopped()
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise socket.timeout("timed out")
+            interval = 0.05 if remaining is None else min(0.05, remaining)
+            readable, writable, _ = select.select(
+                [self._socket] if reading else [],
+                [] if reading else [self._socket], [], interval,
+            )
+            if readable or writable:
+                return
+
+    def recv(self, size: int) -> bytes:
+        deadline = self._deadline()
+        while True:
+            self._check_stopped()
+            try:
+                return self._socket.recv(size)
+            except BlockingIOError:
+                if self._timeout == 0:
+                    raise
+                self._wait(reading=True, deadline=deadline)
+
+    def sendall(self, data: bytes) -> None:
+        deadline = self._deadline()
+        remaining = memoryview(data)
+        while remaining:
+            self._check_stopped()
+            if deadline is not None and self._timeout != 0 and time.monotonic() >= deadline:
+                raise socket.timeout("timed out")
+            try:
+                sent = self._socket.send(remaining)
+            except BlockingIOError:
+                if self._timeout == 0:
+                    raise
+                self._wait(reading=False, deadline=deadline)
+                continue
+            if sent == 0:
+                raise OSError("Connection closed during send")
+            remaining = remaining[sent:]
+
+    def gettimeout(self) -> float | None:
+        return self._timeout
+
+    def settimeout(self, timeout: float | None) -> None:
+        if timeout is not None and timeout < 0:
+            raise ValueError("Timeout value out of range")
+        self._timeout = timeout
+
+    def setsockopt(self, *args: Any) -> None:
+        self._socket.setsockopt(*args)
+
+    def shutdown(self, how: int) -> None:
+        self._socket.shutdown(how)
+
+    def close(self) -> None:
+        self._socket.close()
+
+    def __enter__(self) -> _CancellableConnection:
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
+
+
+def _event_lines(conn: socket.socket | _CancellableConnection):
+    """Keep partial frames ourselves; socket.makefile cannot resume a timeout."""
+    pending = bytearray()
+    while True:
+        chunk = conn.recv(min(65536, MAX_EVENT_LINE_BYTES + 1 - len(pending)))
+        if not chunk:
+            if pending:
+                yield bytes(pending)
+            return
+        pending.extend(chunk)
+        while (end := pending.find(b"\n")) >= 0:
+            yield bytes(pending[:end + 1])
+            del pending[:end + 1]
+        if len(pending) > MAX_EVENT_LINE_BYTES:
+            yield bytes(pending)
+            return
+
+
 def _emit_status(callback: StatusCallback | None, state: str, **details: Any) -> None:
     """Callbacks run on the receiver worker; GUI callers should enqueue them."""
     if callback is None:
@@ -46,7 +153,7 @@ def _emit_status(callback: StatusCallback | None, state: str, **details: Any) ->
             pass
 
 
-def _shutdown_connection(conn: socket.socket | None) -> None:
+def _shutdown_connection(conn: socket.socket | _CancellableConnection | None) -> None:
     if conn is None:
         return
     try:
@@ -377,7 +484,7 @@ class EdgeReturnController:
 
 
 def handle_client(
-    conn: socket.socket,
+    conn: socket.socket | _CancellableConnection,
     address: tuple[str, int],
     client_connected: threading.Event,
     sync_clipboard: bool,
@@ -449,11 +556,11 @@ def handle_client(
         supports_extended=lambda: "clipboard_v2" in peer.get("capabilities", []),
     )
     clipboard_sync.start()
-    with conn, conn.makefile("rb") as reader:
+    with conn:
         try:
-            while (stop_event is None or not stop_event.is_set()) and (
-                line := reader.readline(MAX_EVENT_LINE_BYTES + 1)
-            ):
+            for line in _event_lines(conn):
+                if stop_event is not None and stop_event.is_set():
+                    break
                 if len(line) > MAX_EVENT_LINE_BYTES:
                     print("Bad event: event is too large", flush=True)
                     break
@@ -537,24 +644,10 @@ def serve(
 
     client_connected = threading.Event()
     run_stop = threading.Event()
-    finished = threading.Event()
-    connection_lock = threading.Lock()
-    active_connection: socket.socket | None = None
+    active_connection: socket.socket | _CancellableConnection | None = None
     discovery_thread: threading.Thread | None = None
-    cancellation_thread: threading.Thread | None = None
     failure_message = ""
     failure_stage = "startup"
-
-    def cancel_when_requested() -> None:
-        while not finished.wait(0.05):
-            if stop_event is not None and stop_event.is_set():
-                run_stop.set()
-                with connection_lock:
-                    conn = active_connection
-                # shutdown interrupts recv/readline/sendall, including the auth
-                # handshake. close alone cannot reliably wake a makefile reader.
-                _shutdown_connection(conn)
-                return
 
     try:
         if stop_event is not None and stop_event.is_set():
@@ -584,10 +677,6 @@ def serve(
                 bound_port = server.getsockname()[1]
             if stop_event is not None:
                 server.settimeout(0.2)
-                cancellation_thread = threading.Thread(
-                    target=cancel_when_requested, name="crosskey-receiver-stop", daemon=True,
-                )
-                cancellation_thread.start()
             discovery_thread = threading.Thread(
                 target=broadcast_receiver,
                 args=(bound_port, discovery_port, client_connected, run_stop),
@@ -609,12 +698,14 @@ def serve(
                     conn, address = server.accept()
                 except socket.timeout:
                     continue
-                with connection_lock:
-                    active_connection = conn
+                active_connection = conn
                 if stop_event is not None and stop_event.is_set():
                     _shutdown_connection(conn)
                     conn.close()
                     break
+                if stop_event is not None:
+                    conn = _CancellableConnection(conn, stop_event)
+                    active_connection = conn
                 client_connected.set()
                 print("Discovery broadcast paused while Mac is connected", flush=True)
                 try:
@@ -628,8 +719,7 @@ def serve(
                 finally:
                     _shutdown_connection(conn)
                     conn.close()
-                    with connection_lock:
-                        active_connection = None
+                    active_connection = None
                     client_connected.clear()
                 if stop_event is None or not stop_event.is_set():
                     print("Waiting for Mac connection...", flush=True)
@@ -639,10 +729,8 @@ def serve(
             status("error", stage=failure_stage, fatal=True, message=failure_message)
             raise
     finally:
-        finished.set()
         run_stop.set()
-        with connection_lock:
-            conn = active_connection
+        conn = active_connection
         _shutdown_connection(conn)
         if conn is not None:
             conn.close()
@@ -650,7 +738,7 @@ def serve(
         control_mode_enabled = False
         client_connected.clear()
         try:
-            for worker in (cancellation_thread, discovery_thread):
+            for worker in (discovery_thread,):
                 if (worker is not None and worker is not threading.current_thread()
                         and worker.is_alive()):
                     worker.join(timeout=0.5)

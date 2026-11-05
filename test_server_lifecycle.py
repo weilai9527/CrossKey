@@ -1,14 +1,16 @@
 import errno
 import io
+import select
 import socket
 import threading
+import time
 import unittest
 from contextlib import ExitStack, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from auth import AuthenticationError, authenticate_client
-from protocol import decode_event, encode_event
+from protocol import MAX_EVENT_LINE_BYTES, decode_event, encode_event
 from screen_edges import ScreenBounds
 from windows_monitors import WindowsMonitor
 import win_server
@@ -38,7 +40,7 @@ class ServerLifecycleTests(unittest.TestCase):
         win_server.pressed_remote_keys.clear()
         win_server.pressed_remote_buttons.clear()
 
-    def start_receiver(self, port=0, callback=None):
+    def start_receiver(self, port=0, callback=None, heartbeat_timeout=30):
         run = SimpleNamespace(stop=threading.Event(), condition=threading.Condition(),
                               events=[], errors=[], port=port)
 
@@ -52,7 +54,7 @@ class ServerLifecycleTests(unittest.TestCase):
         def serve():
             try:
                 win_server.serve("127.0.0.1", port, False, True, 0.7, 262144,
-                                 5051, "123456", 30, stop_event=run.stop, on_status=status)
+                                 5051, "123456", heartbeat_timeout, stop_event=run.stop, on_status=status)
             except BaseException as exc:
                 run.errors.append(exc)
 
@@ -192,23 +194,97 @@ class ServerLifecycleTests(unittest.TestCase):
     def test_stop_interrupts_a_socket_writer_with_an_unread_peer(self):
         sending = threading.Event()
         returned = threading.Event()
+        backpressured = threading.Event()
 
         def blocked_client(conn, *_args, **_kwargs):
             conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
-            sending.set()
+            # Fill the actual kernel send buffer, rather than assuming an 8 MB
+            # send blocks on every platform (Windows loopback can buffer it).
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    conn._socket.send(b"x" * 65536)
+                except BlockingIOError:
+                    backpressured.set()
+                    break
+            self.assertTrue(backpressured.is_set(), "Could not fill the socket send buffer")
             try:
-                conn.sendall(b"x" * (8 * 1024 * 1024))
+                # Keep producing until cancellation. This does not presume any
+                # fixed relationship between Windows and Unix buffer sizes.
+                sending.set()
+                while True:
+                    conn.sendall(b"x" * 65536)
             finally:
                 returned.set()
 
         with patch.object(win_server, "handle_client", side_effect=blocked_client):
             run = self.start_receiver()
-            with socket.create_connection(("127.0.0.1", run.port), timeout=2):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+                client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                client.settimeout(2)
+                client.connect(("127.0.0.1", run.port))
                 self.assertTrue(sending.wait(2))
+                self.assertTrue(backpressured.is_set())
                 self.assertFalse(returned.wait(0.05))
                 self.stop_receiver(run)
                 self.assertTrue(returned.is_set())
                 self.assertEqual(run.events[-1]["state"], "stopped")
+
+    def test_partial_and_coalesced_frames_survive_readiness_poll_timeouts(self):
+        run = self.start_receiver()
+        client = self.connect(run)
+        first = encode_event({"type": "heartbeat", "heartbeat_id": "split"})
+        second = encode_event({"type": "heartbeat", "heartbeat_id": "coalesced"})
+        third = encode_event({"type": "heartbeat", "heartbeat_id": "tail"})
+        with client.makefile("rb") as reader:
+            client.sendall(first[:10])
+            self.assertEqual(select.select([client], [], [], 0.12)[0], [])
+            client.sendall(first[10:] + second + third[:12])
+            self.assertEqual(decode_event(reader.readline())["heartbeat_id"], "split")
+            self.assertEqual(decode_event(reader.readline())["heartbeat_id"], "coalesced")
+            client.sendall(third[12:])
+            self.assertEqual(decode_event(reader.readline())["heartbeat_id"], "tail")
+            self.stop_receiver(run)
+
+    def test_partial_frame_still_obeys_heartbeat_timeout(self):
+        run = self.start_receiver(heartbeat_timeout=0.15)
+        client = self.connect(run)
+        client.sendall(b'{"type":')
+        error = self.wait_state(run, "error")
+        self.assertEqual(error["stage"], "receive")
+        self.assertIn("timed out", error["message"])
+        self.wait_state(run, "disconnected")
+        self.stop_receiver(run)
+
+    def test_stop_interrupts_an_incomplete_event_frame(self):
+        run = self.start_receiver()
+        client = self.connect(run)
+        client.sendall(b'{"type":"heartbeat",')
+        self.stop_receiver(run)
+        self.assertNotIn("error", [event["state"] for event in run.events])
+
+    def test_line_buffer_stops_at_protocol_limit(self):
+        conn = Mock()
+        conn.recv.side_effect = lambda size: b"x" * size
+        lines = list(win_server._event_lines(conn))
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(len(lines[0]), MAX_EVENT_LINE_BYTES + 1)
+        self.assertTrue(all(call.args[0] <= 65536 for call in conn.recv.call_args_list))
+
+    def test_cancellable_receive_keeps_requested_timeout(self):
+        left, right = socket.socketpair()
+        with left, right:
+            conn = win_server._CancellableConnection(left, threading.Event())
+            conn.settimeout(0.12)
+            started = time.monotonic()
+            with self.assertRaises(socket.timeout):
+                conn.recv(1)
+            self.assertGreaterEqual(time.monotonic() - started, 0.1)
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertEqual(conn.gettimeout(), 0.12)
+            # A timed-out partial read does not poison a makefile buffer.
+            right.sendall(b"x")
+            self.assertEqual(conn.recv(1), b"x")
 
     def test_bind_failure_reports_error_then_stopped_and_preserves_exception(self):
         statuses = []
