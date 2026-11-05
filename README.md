@@ -8,6 +8,17 @@ Mac 捕获键盘/鼠标事件 -> TCP 发送 -> Windows 接收 -> 模拟键盘/�
 
 使用 F8 快捷键切换控制模式，不传画面，也不是远程桌面。
 
+## v0.6.1 更新
+
+修复剪贴板原生读写卡住时连带阻塞键鼠接收的问题，增加 Windows 控制开启确认和
+心跳响应检测。失去响应时恢复 Mac 本机操作并重连，重连后重新按 F8 或穿屏进入。
+Mac 客户端运行时阻止空闲自动睡眠。新安装默认超时 30 秒，保留已有本地配置的值。
+
+使用 Git 安装时，先退出两端程序，再在各自项目目录执行 `git pull --ff-only`。
+Windows 重新运行 `python win_server.py`，Mac 重新运行 `python3 mac_client.py`。
+使用源码 ZIP 时覆盖项目代码并保留原来的 `config.json`；使用打包程序时需重新打包。
+两端都更新到 v0.6.1 后，才支持本次控制确认和双向心跳检测。
+
 ## 文件
 
 ```text
@@ -123,7 +134,7 @@ python3 configure_ip.py --host 192.168.1.25 --port 5050
   "map_cmd_to_ctrl": true,
   "debug_keys": false,
   "heartbeat_interval": 2.0,
-  "heartbeat_timeout": 8.0,
+  "heartbeat_timeout": 30.0,
   "sync_clipboard": true,
   "clipboard_only_control_mode": true,
   "clipboard_poll_interval": 0.7,
@@ -160,6 +171,12 @@ python3 mac_client.py --no-discover
 3. Mac 按 `F8`，进入控制 Windows 模式
 4. Mac 触控板移动、左右点击、键盘输入会发送到 Windows
 5. 再按一次 `F8`，退出控制模式
+
+两端更新到 v0.6.1 或更新版本后，按 F8 会先显示 `Waiting for Windows to confirm control`。
+收到 Windows 的开启确认后，才显示 `Control Windows mode: ON (confirmed by Windows)`
+并拦截 Mac 本机输入。等待期间仍可操作 Mac，再按 F8 可取消；Windows 拒绝布局或
+确认超时也会保留 Mac 操作。这个确认表示接收端已开启控制，不保证目标应用允许模拟输入。
+旧版 Windows 仍可连接，但 Mac 会明确提示缺少控制和心跳确认，需要两端一起更新。
 
 ### 双向鼠标穿屏
 
@@ -340,7 +357,7 @@ Command + C / Command + V
 从 v0.6.0 起，支持 Mac ↔ Windows 双向同步纯文本、图片、文件/文件夹和富文本。
 **两台电脑都需要更新项目文件、重新安装 `requirements.txt` 中的依赖并重启程序**；
 使用打包程序时，需要分别重新打包 Mac 和 Windows 版本。
-新旧版本混用时仅同步文本，富文本退回纯文本，不发送图片或文件。
+对端早于 v0.6.0 时仅同步文本，富文本退回纯文本，不发送图片或文件。
 
 默认只有控制模式开启时才同步。复制后等待接收端显示 `Clipboard ... received`，
 再在目标应用里粘贴；大文件需要等待传输完成。
@@ -384,6 +401,11 @@ Command + C / Command + V
 键鼠事件优先于 Mac 的文件发送队列；中断连接后重新传输当前剪贴板内容。
 如果传输期间接收端又复制了新内容，会保留接收端的新内容；需要重新传输时请再次复制源内容。
 
+剪贴板的接收、解包和原生读写由独立线程处理，不会占住键鼠接收线程。若原生剪贴板
+操作长时间卡住，接收队列满时仅暂停剪贴板同步，键鼠继续工作；终端会显示
+`Clipboard sync paused`。重连时若仍有卡住的剪贴板操作，也会暂停同步。
+这些情况需重启对应程序恢复剪贴板，已进入系统原生写入的操作无法强制中断。
+
 测试：`python3 -m unittest discover -v`（Windows 使用 `python`）。
 Mac 原生格式集成测试使用独立的私有测试剪贴板，不修改日常剪贴板：
 `CROSSKEY_NATIVE_TEST=1 python3 -m unittest test_native_clipboard.MacNativeClipboardTests -v`。
@@ -400,7 +422,9 @@ Windows 的格式构造和资源释放有模拟测试，发布前仍应在 Windo
 
 ## 断线保护
 
-Mac 默认每 2 秒发送一次连接心跳。Windows 连续 8 秒收不到消息时会主动结束连接，
+Mac 客户端运行期间会通过系统 `caffeinate -i` 阻止空闲自动睡眠，退出后自动恢复。屏幕仍可自动熄灭；手动睡眠或合盖仍可能断开连接。
+
+Mac 默认每 2 秒发送一次连接心跳。Windows 连续 30 秒收不到消息时会主动结束连接，
 并释放所有由 Mac 按下的键和鼠标按钮。正常退出控制模式、Mac 断开和连接超时也会执行
 同样的释放操作，避免 Ctrl、Shift 或鼠标按钮在 Windows 上卡住。
 
@@ -408,10 +432,34 @@ Mac 默认每 2 秒发送一次连接心跳。Windows 连续 8 秒收不到消�
 
 ```json
 "heartbeat_interval": 2.0,
-"heartbeat_timeout": 8.0
+"heartbeat_timeout": 30.0
 ```
 
 `heartbeat_timeout` 必须大于 `heartbeat_interval`。
+
+两端支持控制确认时，Windows 的输入接收线程也会回复心跳。Mac 在 `heartbeat_timeout`
+内收不到回复，或一次发送停顿超过该时长，会关闭连接、恢复 Mac 本机输入并重连。
+检测以 `heartbeat_interval` 为周期，可能比超时值晚一个检测周期。重连后需要重新按 F8
+或推动屏幕边缘进入 Windows，不会自动再次拦截 Mac。已保存的本地配置优先于示例值，
+因此早期安装可能仍使用 8 秒超时；Mac 可通过 `--heartbeat-timeout` 临时调整。
+
+### 显示已连接或开启，但 Windows 没有反应
+
+先确认两端都更新并重启，Mac 的开启提示带有 `(confirmed by Windows)`。
+网络认证、控制开启和目标应用实际接受输入是不同步骤；普通权限的接收端可能无法
+控制管理员窗口或系统安全桌面。
+
+如果终端显示 `Clipboard sync paused`，键鼠应继续工作，重启对应程序恢复剪贴板。
+也可以临时在两端追加 `--no-sync-clipboard` 排除剪贴板影响：
+
+```bash
+# Mac
+python3 mac_client.py --no-sync-clipboard
+# Windows
+python win_server.py --no-sync-clipboard
+```
+
+`Send queue is full` 表示本地发送队列积压，不能单凭这行判断 Wi-Fi 信道拥堵。
 
 ## 常见问题
 

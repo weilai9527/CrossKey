@@ -64,6 +64,16 @@ class ClipboardTransportTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
 
+    def test_stale_failure_does_not_reconnect_healthy_socket(self):
+        sender = EventSender.__new__(EventSender)
+        sender.stop_event = threading.Event()
+        sender.lock = threading.Lock()
+        sender.sock = Mock()
+        sender.reconnect_thread = None
+        with patch("mac_client.threading.Thread") as thread:
+            sender._start_reconnect()
+        thread.assert_not_called()
+
     def test_input_and_heartbeat_are_sent_before_queued_bulk_data(self):
         # Deterministic queue scheduling without threads or a native desktop.
         sender = EventSender.__new__(EventSender)

@@ -64,6 +64,32 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertEqual(event["type"], "heartbeat")
 
+    def test_control_status_round_trip(self) -> None:
+        for event in (
+            {"type": "control_ack", "session_id": "session-1", "enabled": True},
+            {"type": "control_ack", "session_id": "session-1", "enabled": False},
+            {"type": "heartbeat", "heartbeat_id": "ping-1"},
+            {"type": "heartbeat_ack", "heartbeat_id": "ping-1"},
+        ):
+            with self.subTest(event=event):
+                self.assertEqual(decode_event(encode_event(event)),
+                                 dict(event, protocol_version=PROTOCOL_VERSION))
+
+    def test_control_status_rejects_missing_or_invalid_identifiers(self) -> None:
+        for event_type, field in (("control_ack", "session_id"),
+                                  ("heartbeat_ack", "heartbeat_id"),
+                                  ("heartbeat", "heartbeat_id")):
+            base = {"type": event_type, "enabled": True}
+            for value in ("", "x" * 65, 1, None, []):
+                with self.subTest(event_type=event_type, value=value), self.assertRaises(ValueError):
+                    encode_event(dict(base, **{field: value}))
+            if event_type != "heartbeat":
+                with self.assertRaises(ValueError):
+                    encode_event(base)
+        for enabled in (None, 1, "true"):
+            with self.assertRaises(ValueError):
+                encode_event({"type": "control_ack", "session_id": "session-1", "enabled": enabled})
+
     def test_edge_handoff_round_trip(self) -> None:
         for event in (
             {"type": "control_mode", "enabled": True, "edge": "left",

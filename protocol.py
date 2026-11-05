@@ -26,7 +26,9 @@ EVENT_TYPES = {
     "clipboard_chunk",
     "clipboard_ack",
     "control_mode",
+    "control_ack",
     "heartbeat",
+    "heartbeat_ack",
     "return_control",
     "control_rejected",
     "key_down",
@@ -101,6 +103,13 @@ def validate_event(event: dict[str, Any]) -> None:
             mappings = validate_edge_monitors(event["edge_monitors"])
             if not event["enabled"] or not mappings or event.get("edge") not in mappings:
                 raise ValueError("edge_monitors requires an enabled control session and mapped edge")
+    elif event_type == "control_ack":
+        _require_string(event, "session_id", max_length=64)
+        _require_bool(event, "enabled")
+    elif event_type == "heartbeat_ack":
+        _require_string(event, "heartbeat_id", max_length=64)
+    elif event_type == "heartbeat" and "heartbeat_id" in event:
+        _require_string(event, "heartbeat_id", max_length=64)
     elif event_type == "control_rejected":
         _require_string(event, "session_id", max_length=64)
         _require_string(event, "reason", max_length=256)

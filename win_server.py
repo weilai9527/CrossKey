@@ -25,7 +25,7 @@ DEFAULT_PORT = 5050
 DEFAULT_DISCOVERY_PORT = 5051
 DEFAULT_CLIPBOARD_POLL_INTERVAL = 0.7
 DEFAULT_CLIPBOARD_MAX_BYTES = 262144
-DEFAULT_HEARTBEAT_TIMEOUT = 8.0
+DEFAULT_HEARTBEAT_TIMEOUT = 30.0
 
 
 # Keep primary-screen metrics and cursor coordinates in the same pixel space.
@@ -350,7 +350,7 @@ def handle_client(
     print(f"Mac connected from {address[0]}:{address[1]}", flush=True)
     try:
         peer = authenticate_server(conn, pairing_code,
-                                   capabilities=("monitor_mapping_v1", "clipboard_v2"))
+                                   capabilities=("monitor_mapping_v1", "clipboard_v2", "control_status_v1"))
     except (AuthenticationError, OSError, ValueError) as exc:
         print(f"Authentication failed for {address[0]}: {exc}", flush=True)
         conn.close()
@@ -359,8 +359,10 @@ def handle_client(
         return
     print("Mac authenticated", flush=True)
     print("Now press F8 on Mac, or Control + Option + Command + 8.", flush=True)
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     conn.settimeout(heartbeat_timeout)
     send_lock = threading.Lock()
+    supports_control_status = "control_status_v1" in peer.get("capabilities", [])
 
     def send_server_event(event: dict[str, Any]) -> bool:
         try:
@@ -393,10 +395,26 @@ def handle_client(
                 try:
                     event = decode_event(line)
                     if event.get("type") in {"clipboard_text", "clipboard_chunk", "clipboard_ack"}:
-                        clipboard_sync.handle_remote_event(event)
+                        clipboard_sync.submit_remote_event(event)
+                    elif event["type"] == "heartbeat":
+                        # Reply on the input reader thread: a live TCP socket alone
+                        # does not prove that this thread is still processing input.
+                        if supports_control_status and "heartbeat_id" in event:
+                            if not send_server_event({"type": "heartbeat_ack",
+                                                      "heartbeat_id": event["heartbeat_id"]}):
+                                break
                     else:
                         if not edge_return.handle(event):
                             break
+                        if (supports_control_status and event["type"] == "control_mode"
+                                and "session_id" in event
+                                and event["enabled"] == control_mode_enabled):
+                            # A rejected layout already sent control_rejected; never
+                            # follow that rejection with a successful control reply.
+                            if not send_server_event({"type": "control_ack",
+                                                      "session_id": event["session_id"],
+                                                      "enabled": control_mode_enabled}):
+                                break
                 except Exception as exc:
                     print(f"Bad event: {exc}", flush=True)
         except (OSError, TimeoutError) as exc:

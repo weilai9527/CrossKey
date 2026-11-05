@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import queue
 import threading
 import time
 import uuid
@@ -15,6 +16,7 @@ from native_clipboard import Content, create_clipboard
 from protocol import CLIPBOARD_CHUNK_BYTES, CLIPBOARD_LIMITS, validate_event
 
 SendEvent = Callable[[dict[str, Any]], bool]
+REMOTE_EVENT_QUEUE_SIZE = 32
 
 
 class ClipboardSync:
@@ -45,6 +47,12 @@ class ClipboardSync:
         self.supports_extended = supports_extended
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
+        self._remote_events: queue.Queue[tuple[int, dict[str, Any]]] = queue.Queue(
+            maxsize=REMOTE_EVENT_QUEUE_SIZE
+        )
+        self._connection_generation = 0
+        self._receiver_thread: threading.Thread | None = None
+        self._poll_thread: threading.Thread | None = None
         self._revision: int | None = None
         self._cached: Content | None = None
         self._cached_signature: tuple[str, str] | None = None
@@ -61,22 +69,86 @@ class ClipboardSync:
         return self.backend
 
     def start(self) -> None:
-        if self.enabled:
+        if self.enabled and not self.stop_event.is_set() and self._receiver_thread is None:
             print("Clipboard sync is ON (text, images, files, rich text)", flush=True)
-            threading.Thread(target=self._poll_loop, daemon=True).start()
+            self._receiver_thread = threading.Thread(target=self._receive_loop, daemon=True)
+            self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+            self._receiver_thread.start()
+            self._poll_thread.start()
+
+    def _clear_remote_queue(self) -> None:
+        while True:
+            try:
+                self._remote_events.get_nowait()
+            except queue.Empty:
+                return
+
+    def submit_remote_event(self, event: dict[str, Any]) -> bool:
+        """Queue clipboard work without making the socket reader wait for native I/O.
+
+        False pauses clipboard synchronization only; input forwarding must continue.
+        A full queue stops this instance instead of silently dropping transfer chunks.
+        """
+        if self.stop_event.is_set():
+            return False
+        if not self.enabled or event.get("type") not in {
+            "clipboard_text", "clipboard_chunk", "clipboard_ack"
+        }:
+            return True
+        try:
+            self._remote_events.put_nowait((self._connection_generation, event))
+        except queue.Full:
+            self.stop()
+            print("Clipboard sync paused: receive queue is full. Keyboard/mouse control "
+                  "continues; restart the program to resume clipboard sync.", flush=True)
+            return False
+        return True
+
+    def _receive_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                generation, event = self._remote_events.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                with self.lock:
+                    if (not self.stop_event.is_set()
+                            and generation == self._connection_generation):
+                        self.handle_remote_event(event)
+            except Exception as exc:
+                self._report_error(exc)
 
     def stop(self) -> None:
         self.stop_event.set()
-        with self.lock:
-            self._incoming = self._outgoing = None
+        self._clear_remote_queue()
+        # Native clipboard access can be indefinitely blocked by another app.
+        # Disconnect/input cleanup must never wait for that operation.
+        if self.lock.acquire(blocking=False):
+            try:
+                self._incoming = self._outgoing = None
+            finally:
+                self.lock.release()
 
-    def reset_connection(self) -> None:
-        with self.lock:
+    def reset_connection(self) -> bool:
+        if self.stop_event.is_set():
+            return False
+        if not self.lock.acquire(blocking=False):
+            self.stop()
+            print("Clipboard sync paused: clipboard work is still busy during reconnect. "
+                  "Keyboard/mouse control continues; restart the program to resume "
+                  "clipboard sync.", flush=True)
+            return False
+        try:
+            self._connection_generation += 1
+            self._clear_remote_queue()
             self._incoming = self._outgoing = None
             self._completed = None
             # Re-send current local content after reconnect, including transfers
             # that had entered the send queue but had not been applied remotely.
             self._last_sent = None
+            return True
+        finally:
+            self.lock.release()
 
     @staticmethod
     def _signature(content: Content) -> tuple[str, str]:
@@ -119,9 +191,14 @@ class ClipboardSync:
                     self._ack(str(event.get("clipboard_id", "")), False)
 
     def _ack(self, transfer_id: str, accepted: bool) -> None:
+        if self.stop_event.is_set():
+            return
         self._completed = (transfer_id, accepted)
-        self.send_event({"type": "clipboard_ack", "clipboard_id": transfer_id,
-                         "accepted": accepted})
+        self._send({"type": "clipboard_ack", "clipboard_id": transfer_id,
+                    "accepted": accepted})
+
+    def _send(self, event: dict[str, Any]) -> bool:
+        return not self.stop_event.is_set() and self.send_event(event)
 
     def _receive_chunk(self, event: dict[str, Any]) -> None:
         transfer_id = event["clipboard_id"]
@@ -132,14 +209,19 @@ class ClipboardSync:
         if self._incoming and now - self._incoming["updated"] > 60:
             self._incoming = None
         backend = self._native()
+        if self.stop_event.is_set():
+            return
         if backend is None:
             self._ack(transfer_id, False)
             return
         if event["index"] == 0:
+            revision = backend.revision()
+            if self.stop_event.is_set():
+                return
             self._incoming = {"id": transfer_id, "kind": event["kind"], "size": event["size"],
                               "sha256": event["sha256"], "source": event["source"],
                               "buffer": io.BytesIO(), "next": 0, "updated": now,
-                              "revision": backend.revision()}
+                              "revision": revision}
         incoming = self._incoming
         if not incoming or incoming["id"] != transfer_id:
             return
@@ -155,6 +237,8 @@ class ClipboardSync:
         self._incoming = None
         if hashlib.sha256(data).hexdigest() != incoming["sha256"]:
             raise ValueError("clipboard transfer checksum mismatch")
+        if self.stop_event.is_set():
+            return
         if backend.revision() != incoming["revision"]:
             # A new local Copy during a long transfer takes precedence.
             self._ack(transfer_id, False)
@@ -163,7 +247,11 @@ class ClipboardSync:
         self._ack(transfer_id, True)
 
     def _apply(self, kind: str, data: bytes) -> None:
+        if self.stop_event.is_set():
+            return
         backend = self._native()
+        if self.stop_event.is_set():
+            return
         if backend is None:
             if kind != "text":
                 raise ValueError("native clipboard formats are unavailable")
@@ -171,6 +259,8 @@ class ClipboardSync:
             self._revision = None
         else:
             self._revision = backend.write(kind, data)
+        if self.stop_event.is_set():
+            return
         self._cached = kind, data
         self._cached_signature = self._signature(self._cached)
         self._last_sent = self._cached_signature
@@ -200,11 +290,17 @@ class ClipboardSync:
                 self._incoming = self._outgoing = None
                 return
             backend = self._native()
+            if self.stop_event.is_set():
+                return
             revision = backend.revision() if backend else None
+            if self.stop_event.is_set():
+                return
             if revision is None or revision != self._revision:
                 try:
                     if backend:
                         content = backend.read()
+                        if self.stop_event.is_set():
+                            return
                         if backend.revision() != revision:
                             return  # Changed while being read/encoded; try a fresh snapshot.
                     else:
@@ -214,6 +310,8 @@ class ClipboardSync:
                     self._revision, self._cached = revision, None
                     self._outgoing = None
                     self._report_error(exc)
+                    return
+                if self.stop_event.is_set():
                     return
                 self._cached, self._revision = content, revision
                 self._cached_signature = self._signature(content) if content else None
@@ -239,7 +337,7 @@ class ClipboardSync:
                 if len(data) > self.max_bytes:
                     self._last_sent = signature
                     print("Clipboard text skipped: too large", flush=True)
-                elif self.send_event({"type": "clipboard_text", "text": data.decode("utf-8"),
+                elif self._send({"type": "clipboard_text", "text": data.decode("utf-8"),
                                       "clipboard_id": uuid.uuid4().hex, "source": self.local_source}):
                     self._last_sent = signature
                 return
@@ -268,13 +366,14 @@ class ClipboardSync:
                          "source": self.local_source, "kind": kind, "size": len(data),
                          "sha256": signature[1], "index": offset // CLIPBOARD_CHUNK_BYTES,
                          "data": base64.b64encode(chunk).decode("ascii")}
-                if not self.send_event(event):
+                if not self._send(event):
                     break  # Queue pressure/disconnect: retry this chunk, without dropping it.
                 outgoing["offset"] += len(chunk)
                 outgoing["sent_at"] = time.monotonic()
 
     def _should_sync_now(self) -> bool:
-        return self.enabled and (not self.only_control_mode or self.is_control_mode_enabled())
+        return (self.enabled and not self.stop_event.is_set()
+                and (not self.only_control_mode or self.is_control_mode_enabled()))
 
     def _text_size_allowed(self, text: str) -> bool:
         return len(text.encode("utf-8")) <= self.max_bytes

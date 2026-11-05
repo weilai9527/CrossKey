@@ -25,7 +25,7 @@ DEFAULTS: dict[str, Any] = {
     "debug_keys": False,
     "send_queue_size": 2000,
     "heartbeat_interval": 2.0,
-    "heartbeat_timeout": 8.0,
+    "heartbeat_timeout": 30.0,
     "sync_clipboard": True,
     "clipboard_only_control_mode": True,
     "clipboard_poll_interval": 0.7,

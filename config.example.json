@@ -14,7 +14,7 @@
   "debug_keys": false,
   "send_queue_size": 2000,
   "heartbeat_interval": 2.0,
-  "heartbeat_timeout": 8.0,
+  "heartbeat_timeout": 30.0,
   "sync_clipboard": true,
   "clipboard_only_control_mode": true,
   "clipboard_poll_interval": 0.7,

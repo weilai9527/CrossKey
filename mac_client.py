@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import math
+import os
+import subprocess
 import queue
 import socket
 import sys
@@ -139,11 +142,16 @@ class EventSender:
         send_queue_size: int = DEFAULT_SEND_QUEUE_SIZE,
         pairing_code: str = "",
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        response_timeout: float = 30.0,
     ) -> None:
         self.resolve_target = resolve_target
         self.pairing_code = pairing_code
         self.reconnect_delay = reconnect_delay
         self.heartbeat_interval = heartbeat_interval
+        self.response_timeout = response_timeout
+        self.last_heartbeat_ack = time.monotonic()
+        self.pending_heartbeats: set[str] = set()
+        self.send_started_at: float | None = None
         self.send_queue: queue.Queue[bytes] = queue.Queue(maxsize=send_queue_size)
         self.clipboard_queue: queue.Queue[bytes] = queue.Queue(maxsize=8)
         self.send_wakeup = threading.Event()
@@ -160,6 +168,7 @@ class EventSender:
             daemon=True,
         )
         self.reconnect_callback: Callable[[], None] | None = None
+        self.disconnect_callback: Callable[[], None] | None = None
         self.incoming_handler: IncomingEventHandler | None = None
         self.writer_thread.start()
         self.heartbeat_thread.start()
@@ -173,18 +182,23 @@ class EventSender:
         host, port = target
         sock = socket.create_connection((host, port), timeout=10)
         try:
-            result = authenticate_client(sock, self.pairing_code, capabilities=("clipboard_v2",))
+            result = authenticate_client(sock, self.pairing_code,
+                                         capabilities=("clipboard_v2", "control_status_v1"))
         except Exception:
             sock.close()
             raise
         sock.settimeout(None)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         with self.lock:
             self._close_socket_locked()
             self.host = host
             self.port = port
             self.sock = sock
             self.capabilities = set(result.get("capabilities", []))
+            self.last_heartbeat_ack = time.monotonic()
+            self.pending_heartbeats.clear()
+            self.send_started_at = None
         self._start_reader(sock)
 
     def send(self, event: dict[str, Any]) -> bool:
@@ -216,6 +230,9 @@ class EventSender:
     def set_reconnect_callback(self, callback: Callable[[], None]) -> None:
         self.reconnect_callback = callback
 
+    def set_disconnect_callback(self, callback: Callable[[], None]) -> None:
+        self.disconnect_callback = callback
+
     def set_incoming_handler(self, handler: IncomingEventHandler) -> None:
         self.incoming_handler = handler
 
@@ -239,10 +256,24 @@ class EventSender:
                 except queue.Empty:
                     break
 
+    def _connection_failed(self, sock: socket.socket, reason: str) -> None:
+        with self.lock:
+            if self.sock is not sock or self.stop_event.is_set():
+                return
+            self._close_socket_locked()
+            self._clear_send_queue()
+        # Restore local input before attempting any reconnect or clipboard work.
+        if self.disconnect_callback is not None:
+            self.disconnect_callback()
+        print(reason, flush=True)
+        self._start_reconnect()
+
     def _start_reconnect(self) -> None:
         if self.stop_event.is_set():
             return
         with self.lock:
+            if self.sock is not None:
+                return
             if self.reconnect_thread is not None and self.reconnect_thread.is_alive():
                 return
             self.reconnect_thread = threading.Thread(
@@ -291,26 +322,24 @@ class EventSender:
                     if len(line) > MAX_EVENT_LINE_BYTES:
                         print("Bad event from Windows: event is too large", flush=True)
                         break
-                    if self.incoming_handler is None:
-                        continue
                     try:
-                        self.incoming_handler(decode_event(line))
+                        event = decode_event(line)
+                        if event["type"] == "heartbeat_ack":
+                            with self.lock:
+                                heartbeat_id = event["heartbeat_id"]
+                                if self.sock is sock and heartbeat_id in self.pending_heartbeats:
+                                    self.pending_heartbeats.clear()
+                                    self.last_heartbeat_ack = time.monotonic()
+                            continue
+                        if self.incoming_handler is not None:
+                            self.incoming_handler(event)
                     except Exception as exc:
                         print(f"Bad event from Windows: {exc}", flush=True)
         except OSError as exc:
             if not self.stop_event.is_set():
                 print(f"Connection lost while reading events: {exc}", flush=True)
         finally:
-            if not self.stop_event.is_set():
-                with self.lock:
-                    if self.sock is sock:
-                        self._close_socket_locked()
-                        self._clear_send_queue()
-                        should_reconnect = True
-                    else:
-                        should_reconnect = False
-                if should_reconnect:
-                    self._start_reconnect()
+            self._connection_failed(sock, "Windows connection closed; local input restored.")
 
     def _writer_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -332,21 +361,45 @@ class EventSender:
                 continue
 
             try:
+                with self.lock:
+                    if self.sock is not sock:
+                        continue
+                    self.send_started_at = time.monotonic()
                 sock.sendall(data)
             except OSError as exc:
-                print(f"Connection lost while sending event: {exc}", flush=True)
+                self._connection_failed(sock, f"Connection lost while sending event: {exc}")
+            finally:
                 with self.lock:
                     if self.sock is sock:
-                        self._close_socket_locked()
-                        self._clear_send_queue()
-                self._start_reconnect()
+                        self.send_started_at = None
 
     def _heartbeat_loop(self) -> None:
         while not self.stop_event.wait(self.heartbeat_interval):
+            self._heartbeat_tick()
+
+    def _heartbeat_tick(self) -> None:
+        now = time.monotonic()
+        with self.lock:
+            sock = self.sock
+            if sock is None:
+                return
+            confirmed_protocol = "control_status_v1" in self.capabilities
+            unresponsive = confirmed_protocol and now - self.last_heartbeat_ack >= self.response_timeout
+            stalled_send = (self.send_started_at is not None
+                            and now - self.send_started_at >= self.response_timeout)
+            if not unresponsive and not stalled_send and confirmed_protocol:
+                heartbeat_id = uuid.uuid4().hex
+                self.pending_heartbeats.add(heartbeat_id)
+        if unresponsive or stalled_send:
+            reason = "Windows receiver stopped responding" if unresponsive else "Sending to Windows stalled"
+            self._connection_failed(sock, f"{reason}; local input restored. Reconnecting...")
+            return
+        event = {"type": "heartbeat"}
+        if confirmed_protocol:
+            event["heartbeat_id"] = heartbeat_id
+        if not self.send(event) and confirmed_protocol:
             with self.lock:
-                connected = self.sock is not None
-            if connected:
-                self.send({"type": "heartbeat"})
+                self.pending_heartbeats.discard(heartbeat_id)
 
 
 class MacControllerClient:
@@ -370,6 +423,8 @@ class MacControllerClient:
         self.active_edge = next((edge for edge in EDGE_ORDER if edge in self.edge_monitors),
                                 auto_switch_edge)
         self.enabled = False
+        self.pending_control = False
+        self.control_timer: threading.Timer | None = None
         self.last_mouse_pos: tuple[int, int] | None = None
         self.pressed_keys: set[str] = set()
         self.state_lock = threading.RLock()
@@ -399,7 +454,7 @@ class MacControllerClient:
 
     def toggle_control_mode(self, position: float | None = None, edge: str | None = None) -> bool:
         with self.state_lock:
-            enabled = not self.enabled
+            enabled = not (self.enabled or self.pending_control)
             if enabled:
                 if edge is not None:
                     self.active_edge = edge
@@ -407,27 +462,81 @@ class MacControllerClient:
             # Never capture local input if the activation cannot be queued.
             if not self.sender.send(self.control_event(enabled, position)) and enabled:
                 return False
-            self.enabled = enabled
+            self._cancel_control_timer()
+            capabilities = getattr(self.sender, "capabilities", set())
+            # Test/fallback senders may have no negotiated capabilities.
+            needs_confirmation = isinstance(capabilities, set) and "control_status_v1" in capabilities
+            self.pending_control = enabled and needs_confirmation
+            self.enabled = enabled and not self.pending_control
             self.last_mouse_pos = None
             if not enabled:
                 self.edge_cooldown_until = time.monotonic() + 0.25
+            if self.pending_control:
+                self.control_timer = threading.Timer(
+                    self.sender.response_timeout, self._control_confirmation_timed_out,
+                    args=(self.session_id,),
+                )
+                self.control_timer.daemon = True
+                self.control_timer.start()
+                print("Waiting for Windows to confirm control; Mac input remains available.", flush=True)
+                return True
 
         state = "ON" if enabled else "OFF"
         print(f"Control Windows mode: {state}", flush=True)
         return True
 
+    def _cancel_control_timer(self) -> None:
+        if self.control_timer is not None:
+            self.control_timer.cancel()
+            self.control_timer = None
+
+    def _control_confirmation_timed_out(self, session_id: str) -> None:
+        with self.state_lock:
+            if not self.pending_control or self.session_id != session_id:
+                return
+            self.pending_control = False
+            self.control_timer = None
+            self.last_mouse_pos = None
+            self.edge_cooldown_until = time.monotonic() + 0.25
+            self.sender.send(self.control_event(False))
+        print("Windows did not confirm control. Mac input is available; check the Windows receiver.",
+              flush=True)
+
+    def handle_connection_lost(self) -> None:
+        with self.state_lock:
+            self._cancel_control_timer()
+            self.enabled = self.pending_control = False
+            self.last_mouse_pos = None
+            self.pressed_keys.clear()
+            self.edge_cooldown_until = time.monotonic() + 0.25
+
     def handle_remote_event(self, event: dict[str, Any]) -> None:
-        if event.get("type") not in {"return_control", "control_rejected"}:
+        if event.get("type") not in {"return_control", "control_rejected", "control_ack"}:
+            return
+        if event["type"] == "control_ack":
+            with self.state_lock:
+                confirmed = (event["session_id"] == self.session_id
+                             and self.pending_control and event["enabled"])
+                if confirmed:
+                    self._cancel_control_timer()
+                    self.pending_control = False
+                    self.enabled = True
+                    self.last_mouse_pos = None
+            if confirmed:
+                print("Control Windows mode: ON (confirmed by Windows)", flush=True)
             return
         with self.state_lock:
-            if not self.enabled or event["session_id"] != self.session_id:
+            if event["session_id"] != self.session_id:
+                return
+            if not self.enabled and not self.pending_control:
                 return
             rejected = event["type"] == "control_rejected"
             allowed_edges = self.edge_monitors or {self.auto_switch_edge: None}
             if not rejected and event["edge"] not in allowed_edges:
                 return
             bounds = self.screen_bounds()
-            self.enabled = False
+            self._cancel_control_timer()
+            self.enabled = self.pending_control = False
             self.last_mouse_pos = None
             self.pressed_keys.clear()
             self.edge_cooldown_until = time.monotonic() + 0.25
@@ -578,7 +687,8 @@ class MacControllerClient:
         dy: int = 0,
     ) -> bool:
         with self.state_lock:
-            if (self.enabled or (not self.edge_monitors and self.auto_switch_edge == "off")
+            if (self.enabled or self.pending_control
+                    or (not self.edge_monitors and self.auto_switch_edge == "off")
                     or time.monotonic() < self.edge_cooldown_until):
                 return False
             bounds = self.screen_bounds()
@@ -600,7 +710,7 @@ class MacControllerClient:
             if not self.toggle_control_mode(position, edge):
                 return False
         print(
-            f"Activated Windows control from Mac {edge} edge. "
+            f"Requested Windows control from Mac {edge} edge. "
             "Move back across the Windows edge or press F8 to return.",
             flush=True,
         )
@@ -1004,6 +1114,12 @@ def parse_args() -> argparse.Namespace:
         help="Seconds between connection heartbeat messages.",
     )
     parser.add_argument(
+        "--heartbeat-timeout",
+        type=float,
+        default=float(config.get("heartbeat_timeout", 30.0)),
+        help="Seconds to wait for Windows responses or a stalled send before restoring Mac input.",
+    )
+    parser.add_argument(
         "--sync-clipboard",
         action=argparse.BooleanOptionalAction,
         default=bool(config.get("sync_clipboard", True)),
@@ -1037,6 +1153,10 @@ def parse_args() -> argparse.Namespace:
         args.auto_switch_edge = str(config.get("auto_switch_edge", "off"))
     if not 1 <= args.edge_margin <= 100:
         parser.error("edge-margin must be between 1 and 100")
+    if not math.isfinite(args.heartbeat_interval) or args.heartbeat_interval <= 0:
+        parser.error("heartbeat-interval must be a finite positive number")
+    if not math.isfinite(args.heartbeat_timeout) or args.heartbeat_timeout <= args.heartbeat_interval:
+        parser.error("heartbeat-timeout must be finite and greater than heartbeat-interval")
     args.host_from_cli = args.host is not None
     args.host = args.host if args.host is not None else config.get("windows_host")
     args.port = args.port if args.port is not None else int(config.get("port", DEFAULT_PORT))
@@ -1046,6 +1166,27 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # -i prevents idle system sleep while allowing the display to turn off.
+    # -w also releases the assertion if Python is terminated unexpectedly.
+    inhibitor = None
+    if sys.platform == "darwin":
+        try:
+            inhibitor = subprocess.Popen(
+                ["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())],
+                stdin=subprocess.DEVNULL,
+            )
+            print("Mac idle sleep prevention is ON while the client is running.", flush=True)
+        except OSError as exc:
+            print(f"WARNING: Cannot prevent idle sleep: {exc}", flush=True)
+    try:
+        run_client()
+    finally:
+        if inhibitor is not None:
+            inhibitor.terminate()
+            inhibitor.wait()
+
+
+def run_client() -> None:
     args = parse_args()
     if (args.auto_switch_edge != "off" or args.edge_monitors) and (
         sys.platform != "darwin" or not args.suppress_local_mouse
@@ -1071,6 +1212,7 @@ def main() -> None:
         send_queue_size=args.send_queue_size,
         pairing_code=args.pairing_code,
         heartbeat_interval=args.heartbeat_interval,
+        response_timeout=args.heartbeat_timeout,
     )
     initial_host, initial_port = initial_target
     print(f"Connecting to Windows at {initial_host}:{initial_port}...", flush=True)
@@ -1092,6 +1234,9 @@ def main() -> None:
         raise SystemExit("Multi-monitor mapping requires Windows receiver v0.5.0 or newer. "
                          "Update and restart win_server.py first.")
     print("Connected and authenticated with Windows", flush=True)
+    if "control_status_v1" not in sender.capabilities:
+        print("Windows receiver has no control/heartbeat confirmation. Update both ends for response checks.",
+              flush=True)
     print("Press F8 to control Windows. Press F8 again to stop.", flush=True)
     print("If F8 is a media key, use Control + Option + Command + 8.", flush=True)
     if args.suppress_local_mouse and sys.platform == "darwin":
@@ -1135,14 +1280,14 @@ def main() -> None:
     )
     def recover_after_reconnect() -> None:
         clipboard_sync.reset_connection()
-        client.recover_remote_state_after_reconnect()
 
     sender.set_reconnect_callback(recover_after_reconnect)
+    sender.set_disconnect_callback(client.handle_connection_lost)
     def handle_incoming_event(event: dict[str, Any]) -> None:
-        if event.get("type") in {"return_control", "control_rejected"}:
+        if event.get("type") in {"return_control", "control_rejected", "control_ack"}:
             client.handle_remote_event(event)
         else:
-            clipboard_sync.handle_remote_event(event)
+            clipboard_sync.submit_remote_event(event)
 
     sender.set_incoming_handler(handle_incoming_event)
     clipboard_sync.start()
@@ -1166,6 +1311,7 @@ def main() -> None:
         except KeyboardInterrupt:
             pass
         finally:
+            client.handle_connection_lost()
             clipboard_sync.stop()
             sender.close()
         return
@@ -1186,6 +1332,7 @@ def main() -> None:
         keyboard_listener.start()
         keyboard_listener.join()
     finally:
+        client.handle_connection_lost()
         mouse_listener.stop()
         clipboard_sync.stop()
         sender.close()
