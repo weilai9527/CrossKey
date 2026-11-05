@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
+import os
 import socket
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from pynput import keyboard, mouse
@@ -440,19 +443,37 @@ def serve(
     heartbeat_timeout: float,
 ) -> None:
     client_connected = threading.Event()
-    discovery_thread = threading.Thread(
-        target=broadcast_receiver,
-        args=(port, discovery_port, client_connected),
-        daemon=True,
-    )
-    discovery_thread.start()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((host, port))
+        if sys.platform == "win32":
+            # On Windows SO_REUSEADDR can let two receivers share a listening
+            # port, making the process that accepts a connection unpredictable.
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.bind((host, port))
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) in {10048, 10013}:
+                hint = (
+                    f"Port {port} may already be in use or reserved. Close the existing CrossKey "
+                    "Windows receiver before starting another one. "
+                    f"On Windows, use netstat -ano to check the listening PID for port {port}."
+                )
+            else:
+                hint = "Check that the requested IP belongs to this computer and the port is available."
+            raise SystemExit(f"ERROR: Cannot bind Windows receiver to {host}:{port}: {exc}\n{hint}") from exc
         server.listen(1)
+        discovery_thread = threading.Thread(
+            target=broadcast_receiver,
+            args=(port, discovery_port, client_connected),
+            daemon=True,
+        )
+        discovery_thread.start()
         print(f"CrossKey Windows v{__version__}", flush=True)
         print("Windows Receiver started", flush=True)
+        print(f"Receiver PID: {os.getpid()}", flush=True)
+        print(f"Receiver script: {Path(__file__).resolve()}", flush=True)
         print(f"Listening on {host}:{port}", flush=True)
         print(f"Broadcasting discovery on UDP port {discovery_port}", flush=True)
         print(f"Pairing code: {pairing_code}", flush=True)
