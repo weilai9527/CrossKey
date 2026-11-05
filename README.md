@@ -54,8 +54,9 @@ Tcl/Tk 时会显示错误并暂停。Mac 的 `.command` 由终端启动；界面
 两端脚本优先使用项目中的 `.venv` 或 `venv`（若存在对应 Python）。
 如果窗口启动失败，使用表中的终端命令查看完整错误。
 
-本次为源码更新及本机打包入口；仓库内没有预先构建的 Windows `.exe` 附件。
-Windows 的启动、界面及真实输入效果仍需在 Windows 机器上验收。
+Git 更新后可直接使用上述启动脚本。便携包以 [Releases 页面](https://github.com/weilai9527/CrossKey/releases)
+实际附件为准：两平台自动检查通过后，发布流程才会生成 Windows 包。
+真实键鼠和多屏穿越效果仍需在设备上验收。
 原来的 `python win_server.py` / `python3 mac_client.py` 命令行入口继续保留，见下文。
 
 ## v0.6.2 更新
