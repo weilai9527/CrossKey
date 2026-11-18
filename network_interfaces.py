@@ -35,7 +35,9 @@ ConvertTo-Json -InputObject $items -Compress
     try:
         result = subprocess.run(
             [command, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, check=True, timeout=5,
+            # The first NetTCPIP/CIM module load on Windows can exceed five
+            # seconds. This runs in a background worker, never on the UI loop.
+            capture_output=True, check=True, timeout=15,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         records = json.loads(result.stdout.decode("utf-8-sig"))

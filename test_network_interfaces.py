@@ -15,13 +15,19 @@ class WindowsInterfaceTests(unittest.TestCase):
         # cannot silently pass as an empty interface list in mocked tests.
         execute = subprocess.run
         results = []
+        errors = []
         def capture(*args, **kwargs):
-            result = execute(*args, **kwargs)
+            try:
+                result = execute(*args, **kwargs)
+            except (OSError, subprocess.SubprocessError) as exc:
+                errors.append(f"{type(exc).__name__}: {exc}; stderr={getattr(exc, 'stderr', None)!r}")
+                raise
             results.append(result)
             return result
         with patch("network_interfaces.subprocess.run", side_effect=capture):
             windows_lan_interfaces()
-        self.assertEqual(len(results), 1, "Windows adapter enumeration failed or timed out")
+        self.assertEqual(errors, [], "Windows adapter enumeration failed or timed out")
+        self.assertEqual(len(results), 1)
         records = json.loads(results[0].stdout.decode("utf-8-sig"))
         self.assertIsInstance(records, list)
         for record in records:
