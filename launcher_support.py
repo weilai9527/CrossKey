@@ -11,13 +11,14 @@ import getpass
 import hashlib
 import ipaddress
 import os
-from pathlib import Path
 import re
 import socket
 import subprocess
 import sys
 import threading
 import time
+
+from network_interfaces import windows_lan_interfaces
 
 
 def _usable_ipv4(values: list[str]) -> list[str]:
@@ -38,20 +39,13 @@ def _usable_ipv4(values: list[str]) -> list[str]:
 def local_ipv4_addresses() -> list[str]:
     """Read assigned local IPv4 addresses without DNS or an Internet probe.
 
-    More than one address is legitimate (Wi-Fi, Ethernet, VPN, etc.). The UI
+    More than one address is legitimate (Wi-Fi, Ethernet, etc.). The UI
     should list these addresses rather than guessing that one is reachable by
     the other computer. No persistent helper process is created.
     """
     try:
         if sys.platform == "win32":
-            command = str(Path(os.environ.get("SystemRoot", r"C:\Windows"))
-                          / "System32" / "ipconfig.exe")
-            output = subprocess.run(
-                [command], capture_output=True, check=False, timeout=3,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            ).stdout.decode("ascii", errors="ignore")
-            # The IPv4 token and address are ASCII even in localized ipconfig.
-            values = re.findall(r"IPv4[^\r\n:]*:\s*(\d+\.\d+\.\d+\.\d+)", output)
+            values = [str(interface.ip) for interface in windows_lan_interfaces()]
         elif sys.platform == "darwin":
             output = subprocess.run(
                 ["/sbin/ifconfig", "-a"], capture_output=True, check=False,

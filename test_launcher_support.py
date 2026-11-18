@@ -32,26 +32,14 @@ en4: flags=8863<UP,BROADCAST,RUNNING> mtu 1500
             self.assertEqual(local_ipv4_addresses(), ["172.20.10.9"])
             self.assertEqual(run.call_args.args[0], ["/sbin/ifconfig", "-a"])
 
-    def test_windows_localized_output_filters_invalid_addresses_and_keeps_multiple_adapters(self):
-        output = """Windows IP 配置
-   IPv4 地址 . . . . . . . . . . . . : 172.20.10.8(首选)
-   IPv4 Address. . . . . . . . . . . : 10.0.0.4(Preferred)
-   IPv4 地址 . . . . . . . . . . . . : 172.20.10.8
-   自动配置 IPv4 地址 . . . . . . . : 169.254.1.2
-   IPv4 Address: 127.0.0.1
-   IPv4 Address: 0.0.0.0
-   IPv4 Address: 0.9.8.7
-   IPv4 Address: 224.0.0.1
-   IPv4 Address: 255.255.255.255
-   IPv4 Address: 999.0.0.1
-""".encode()
+    def test_windows_uses_filtered_interfaces_and_deduplicates_addresses(self):
+        from ipaddress import IPv4Interface
+        interfaces = [IPv4Interface("172.20.10.8/28"), IPv4Interface("10.0.0.4/24"),
+                      IPv4Interface("172.20.10.8/24")]
         with patch.object(launcher_support.sys, "platform", "win32"), \
-                patch.object(launcher_support.subprocess, "run") as run, \
+                patch.object(launcher_support, "windows_lan_interfaces", return_value=interfaces), \
                 patch.object(launcher_support.socket, "getaddrinfo") as dns:
-            run.return_value.stdout = output
             self.assertEqual(local_ipv4_addresses(), ["10.0.0.4", "172.20.10.8"])
-            self.assertIn("ipconfig.exe", run.call_args.args[0][0])
-            self.assertIn("creationflags", run.call_args.kwargs)
             dns.assert_not_called()
 
     def test_address_lookup_failures_are_empty_not_a_loopback_or_stale_guess(self):

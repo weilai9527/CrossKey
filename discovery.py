@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import sys
+import time
+
+from network_interfaces import windows_lan_interfaces
 
 
 DISCOVERY_APP = "mac-control-windows"
@@ -45,12 +49,36 @@ def broadcast_receiver(
         {"app": DISCOVERY_APP, "tcp_port": tcp_port}, separators=(",", ":")
     ).encode("utf-8")
     stop_event = stop_event or threading.Event()
+    interfaces = []
+    refresh_at = 0.0
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         while not stop_event.is_set():
             if not client_connected.is_set():
-                try:
-                    sock.sendto(payload, ("255.255.255.255", discovery_port))
-                except OSError as exc:
-                    print(f"Discovery broadcast failed: {exc}", flush=True)
+                if sys.platform == "win32":
+                    if time.monotonic() >= refresh_at:
+                        interfaces = windows_lan_interfaces()
+                        refresh_at = time.monotonic() + 30.0
+                        if not interfaces:
+                            print("Discovery: no active physical IPv4 interface found; "
+                                  "check Wi-Fi/Ethernet and refresh the network.", flush=True)
+                    for interface in interfaces:
+                        if stop_event.is_set():
+                            break
+                        # /31 and /32 have no broadcast host address.
+                        if interface.network.prefixlen >= 31:
+                            continue
+                        try:
+                            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as lan:
+                                lan.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                                lan.bind((str(interface.ip), 0))
+                                lan.sendto(payload, (str(interface.network.broadcast_address),
+                                                     discovery_port))
+                        except OSError as exc:
+                            print(f"Discovery broadcast on {interface.ip} failed: {exc}", flush=True)
+                else:
+                    try:
+                        sock.sendto(payload, ("255.255.255.255", discovery_port))
+                    except OSError as exc:
+                        print(f"Discovery broadcast failed: {exc}", flush=True)
             stop_event.wait(DISCOVERY_INTERVAL_SECONDS)
